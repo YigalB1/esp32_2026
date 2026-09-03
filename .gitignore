@@ -1,0 +1,8 @@
+# Ignore EasyEDA backup snapshots
+pcb/esp32_2026_backup/
+
+# Common local editor/system files
+.vscode/
+.DS_Store
+Thumbs.db
+*.log

@@ -19,53 +19,7 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <ArduinoJson.h>
-#include <PubSubClient.h>
 #include "../../shared/EspNowProtocol.h"
-
-// ---------------- MQTT config ----------------
-// Credentials live in secrets.h (gitignored) - see secrets.h.example for
-// the template. Never commit real WiFi/MQTT credentials to this file.
-#include "secrets.h"
-const int   MQTT_BROKER_PORT = 1883;
-const char* MQTT_TOPIC = "ramzor/bridge2/events"; // must match the Python listener's TOPIC
-
-WiFiClient espWifiClient;
-PubSubClient mqttClient(espWifiClient);
-
-void connectWiFi() {
-  Serial.print("{\"event\":\"wifi_connecting\",\"ssid\":\"");
-  Serial.print(WIFI_SSID);
-  Serial.println("\"}");
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
-    delay(250);
-  }
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("{\"event\":\"wifi_connected\",\"ip\":\"");
-    Serial.print(WiFi.localIP());
-    Serial.println("\"}");
-  } else {
-    Serial.println("{\"event\":\"error\",\"message\":\"WiFi connect timed out\"}");
-  }
-}
-
-void connectMqtt() {
-  if (WiFi.status() != WL_CONNECTED) return;
-  mqttClient.setServer(MQTT_BROKER_HOST, MQTT_BROKER_PORT);
-  Serial.print("{\"event\":\"mqtt_connecting\",\"broker\":\"");
-  Serial.print(MQTT_BROKER_HOST);
-  Serial.println("\"}");
-  // Client ID must be unique on the broker; bridge's own MAC works well for this.
-  String clientId = "esp_bridge2_" + WiFi.macAddress();
-  if (mqttClient.connect(clientId.c_str())) {
-    Serial.println("{\"event\":\"mqtt_connected\"}");
-  } else {
-    Serial.print("{\"event\":\"error\",\"message\":\"MQTT connect failed\",\"rc\":");
-    Serial.print(mqttClient.state());
-    Serial.println("}");
-  }
-}
 
 // ---------------- Known devices (MAC -> friendly name) ----------------
 struct KnownDevice {
@@ -157,28 +111,16 @@ void onDataRecv(const uint8_t *mac_addr, const uint8_t *data, int len) {
   Serial.println(); // break out of any accumulated dot-line first
   serializeJson(doc, Serial);
   Serial.println();
-
-  // Also publish the same JSON payload over MQTT, if connected.
-  if (mqttClient.connected()) {
-    String payload;
-    serializeJson(doc, payload);
-    mqttClient.publish(MQTT_TOPIC, payload.c_str());
-  }
 }
 
 void setup() {
   Serial.begin(115200);
   delay(500);
 
-  // WIFI_STA mode is needed for both ESP-NOW and a normal WiFi/MQTT
-  // connection to coexist - ESP-NOW keeps working the same as before.
   WiFi.mode(WIFI_STA);
   Serial.print("{\"event\":\"boot\",\"bridge_mac\":\"");
   Serial.print(WiFi.macAddress());
   Serial.println("\"}");
-
-  connectWiFi();
-  connectMqtt();
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("{\"event\":\"error\",\"message\":\"ESP-NOW init failed\"}");
@@ -198,18 +140,5 @@ void loop() {
   if (millis() - lastActivity >= 10000 && millis() - lastDot >= 10000) {
     lastDot = millis();
     Serial.print(".");
-  }
-
-  // Keep the MQTT connection alive; reconnect if it drops.
-  if (WiFi.status() == WL_CONNECTED) {
-    if (!mqttClient.connected()) {
-      static unsigned long lastReconnectAttempt = 0;
-      if (millis() - lastReconnectAttempt > 5000) {
-        lastReconnectAttempt = millis();
-        connectMqtt();
-      }
-    } else {
-      mqttClient.loop();
-    }
   }
 }

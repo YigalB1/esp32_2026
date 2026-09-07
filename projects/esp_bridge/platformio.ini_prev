@@ -1,0 +1,17 @@
+; PlatformIO Project Configuration File — esp_bridge
+; Board: bare ESP32 dev board, connected via USB to a laptop.
+; Receives ESP-NOW messages from other devices and relays them as JSON
+; over Serial. See esp_bridge_main.cpp and ../shared/EspNowProtocol.h.
+
+[env:esp32dev]
+platform = espressif32
+board = esp32dev
+framework = arduino
+monitor_speed = 115200
+upload_speed = 921600
+board_build.partitions = huge_app.csv
+
+lib_deps =
+    bblanchon/ArduinoJson @ ^7.0.4
+    knolleary/PubSubClient@^2.8
+    ; esp_now and WiFi come from the arduino-esp32 core, no lib_dep needed

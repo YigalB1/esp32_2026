@@ -89,7 +89,41 @@ void motorIdle() {
   aw.analogWrite(PIN_MOTOR1_IN2, 0);
 }
 
+// ---------------- Live telemetry for heartbeat ----------------
+// Updated each loop() tick as the self-test runs, so the periodic heartbeat
+// (below) reports the actual current direction/speed rather than dummy
+// zeros - useful for a PC dashboard's live readout between real events.
+int8_t currentDirection = 0; // 1 = forward, -1 = backward, 0 = stopped
+uint8_t currentSpeedByte = 0;
+
+const unsigned long HEARTBEAT_INTERVAL_MS = 30000;
+unsigned long lastHeartbeatMs = 0;
+
+void sendHeartbeat() {
+  EspNowMessage msg = {};
+  msg.type = MSG_TRAIN_CONTROL;
+  msg.payload.trainControl.direction = currentDirection;
+  msg.payload.trainControl.speed = currentSpeedByte;
+  msg.payload.trainControl.location = 0.0f; // not tracked yet
+  msg.payload.trainControl.reason = REASON_HEARTBEAT;
+  esp_err_t result = esp_now_send(bridgeMac, (uint8_t *)&msg, sizeof(msg));
+  Serial.printf("[heartbeat] dir=%d speed=%u, queue result=%d\n", currentDirection, currentSpeedByte, result);
+}
+
 // ---------------- ESP-NOW boot message ----------------
+// NOTE: esp_now_send()'s return value only means "queued", not "delivered".
+// On a cold boot, the very first ESP-NOW packet can be silently dropped
+// because the WiFi radio isn't fully settled yet, even though the call
+// reports success. Use the actual delivery-confirmation callback and retry
+// a few times so the boot announcement reliably reaches the bridge.
+volatile bool sendComplete = false;
+volatile bool lastSendSuccess = false;
+
+void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  lastSendSuccess = (status == ESP_NOW_SEND_SUCCESS);
+  sendComplete = true;
+}
+
 void sendBootMessage() {
   EspNowMessage msg = {};
   msg.type = MSG_TRAIN_CONTROL;
@@ -97,8 +131,26 @@ void sendBootMessage() {
   msg.payload.trainControl.speed = 0;
   msg.payload.trainControl.location = 0.0f;
   msg.payload.trainControl.reason = REASON_BOOT;
-  esp_err_t result = esp_now_send(bridgeMac, (uint8_t *)&msg, sizeof(msg));
-  Serial.printf("[boot] esp_now_send result=%d\n", result);
+
+  const int maxAttempts = 4;
+  for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+    sendComplete = false;
+    lastSendSuccess = false;
+    esp_err_t result = esp_now_send(bridgeMac, (uint8_t *)&msg, sizeof(msg));
+    Serial.printf("[boot] esp_now_send attempt %d, queue result=%d\n", attempt, result);
+
+    unsigned long waitStart = millis();
+    while (!sendComplete && millis() - waitStart < 200) {
+      delay(5);
+    }
+
+    if (lastSendSuccess) {
+      Serial.printf("[boot] delivery confirmed on attempt %d\n", attempt);
+      return;
+    }
+    delay(150); // brief pause before retrying - lets the radio settle further
+  }
+  Serial.println("[boot] warning: delivery not confirmed after all retries");
 }
 
 void setup() {
@@ -129,6 +181,7 @@ void setup() {
   if (esp_now_init() != ESP_OK) {
     Serial.println("[error] esp_now_init failed - continuing without telemetry");
   } else {
+    esp_now_register_send_cb(onDataSent);
     esp_now_peer_info_t peerInfo = {};
     memcpy(peerInfo.peer_addr, bridgeMac, 6);
     peerInfo.channel = 0;
@@ -148,6 +201,7 @@ void setup() {
   Serial.println("[train_ctrl_c3] starting motor self-test loop");
   stateStartMs = millis();
   testState = TS_FORWARD_RAMP;
+  lastHeartbeatMs = millis();
 }
 
 void loop() {
@@ -157,7 +211,9 @@ void loop() {
     case TS_FORWARD_RAMP: {
       setLed(1); // green
       float frac = min(1.0f, (float)elapsed / (float)RAMP_MS);
-      motorForward((uint8_t)(frac * MAX_DUTY));
+      currentDirection = 1;
+      currentSpeedByte = (uint8_t)(frac * MAX_DUTY);
+      motorForward(currentSpeedByte);
       if (elapsed >= RAMP_MS) {
         testState = TS_STOP_AFTER_FWD;
         stateStartMs = millis();
@@ -167,6 +223,8 @@ void loop() {
 
     case TS_STOP_AFTER_FWD: {
       setLed(0); // red
+      currentDirection = 0;
+      currentSpeedByte = 0;
       motorBrake();
       if (elapsed >= STOP_PAUSE_MS) {
         testState = TS_BACKWARD_RAMP;
@@ -178,7 +236,9 @@ void loop() {
     case TS_BACKWARD_RAMP: {
       setLed(2); // yellow
       float frac = min(1.0f, (float)elapsed / (float)RAMP_MS);
-      motorBackward((uint8_t)(frac * MAX_DUTY));
+      currentDirection = -1;
+      currentSpeedByte = (uint8_t)(frac * MAX_DUTY);
+      motorBackward(currentSpeedByte);
       if (elapsed >= RAMP_MS) {
         testState = TS_STOP_AFTER_BCK;
         stateStartMs = millis();
@@ -188,6 +248,8 @@ void loop() {
 
     case TS_STOP_AFTER_BCK: {
       setLed(0); // red
+      currentDirection = 0;
+      currentSpeedByte = 0;
       motorBrake();
       if (elapsed >= STOP_PAUSE_MS) {
         testState = TS_FORWARD_RAMP;
@@ -195,6 +257,13 @@ void loop() {
       }
       break;
     }
+  }
+
+  // Periodic "I'm still alive" heartbeat, independent of the motor test's
+  // own state-change reporting (which doesn't exist yet in this build).
+  if (millis() - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
+    lastHeartbeatMs = millis();
+    sendHeartbeat();
   }
 
   delay(TICK_MS);

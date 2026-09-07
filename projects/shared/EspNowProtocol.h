@@ -18,6 +18,14 @@
 //    are identical to the old TrafficLightReason.
 //    ACTION REQUIRED: copy this file into the traffic-light and bridge
 //    projects as well.
+//  - Added REASON_HEARTBEAT - a periodic "I'm still alive" message, sent on
+//    a timer (e.g. every 30s) independent of any real state change. No
+//    struct layout change, just a new enum value. Consumers (the PC
+//    dashboard) use "any message from this device, any reason" as the
+//    liveness signal, so no dashboard change is needed to support this -
+//    it just starts working once senders add periodic heartbeat sends.
+//    ACTION REQUIRED: copy this file into the traffic-light and bridge
+//    projects as well.
 
 #pragma once
 #include <stdint.h>
@@ -32,6 +40,7 @@ enum MsgType : uint8_t {
 enum EspNowReason : uint8_t {
   REASON_BOOT = 0,         // device just powered on / reset
   REASON_STATE_CHANGE = 1, // the device's reported state changed
+  REASON_HEARTBEAT = 2,    // periodic "I'm still alive", no state change
 };
 
 typedef struct {

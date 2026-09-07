@@ -1,4 +1,13 @@
-// esp_bridge - ESP32 firmware
+// esp_bridge - ESP32 firmware (classic ESP32 dev board, wired USB)
+//
+// INTERIM PLAN: this runs on the original classic ESP32 dev board (external
+// CP2102/CH340 USB-serial chip) as a stopgap while waiting on an ESP32-S3
+// for the planned custom-USB-identity version (see esp_bridge_main.cpp's
+// C3 attempt in chat history for why C3 specifically doesn't work for that -
+// it lacks the USB-OTG peripheral needed for custom VID/PID/serial; only
+// S2/S3 have it). No WiFi, no Bluetooth - plain wired USB Serial only.
+// Meant to be physically disconnected while other boards are being
+// programmed via PlatformIO, so there's no port-conflict risk during flashing.
 //
 // THIS DEVICE: Bridge #2, MAC CC:DB:A7:69:97:DC. A Bridge #3 is planned for
 // later (not wired up yet) - if/when it's added, remember each sender device
@@ -6,10 +15,9 @@
 // report to.
 //
 // General-purpose bridge - not specific to any one device type (traffic
-// light, train control, etc.). Sits on a bare ESP32, connected via USB to a Windows laptop. Listens for
-// ESP-NOW messages from other devices (traffic lights, train control, etc.),
-// looks up the sender's MAC in a known-devices table to get a friendly name,
-// and forwards each message to the laptop as one JSON line over Serial.
+// light, train control, etc.). Listens for ESP-NOW messages from other
+// devices, looks up the sender's MAC in a known-devices table to get a
+// friendly name, and forwards each message as one JSON line over USB Serial.
 //
 // NOTE: this firmware currently only RECEIVES over ESP-NOW - there is no
 // send path back out. If/when commands need to be relayed to devices like
@@ -19,53 +27,7 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <ArduinoJson.h>
-#include <PubSubClient.h>
 #include "../../shared/EspNowProtocol.h"
-
-// ---------------- MQTT config ----------------
-// Credentials live in secrets.h (gitignored) - see secrets.h.example for
-// the template. Never commit real WiFi/MQTT credentials to this file.
-#include "secrets.h"
-const int   MQTT_BROKER_PORT = 1883;
-const char* MQTT_TOPIC = "ramzor/bridge2/events"; // must match the Python listener's TOPIC
-
-WiFiClient espWifiClient;
-PubSubClient mqttClient(espWifiClient);
-
-void connectWiFi() {
-  Serial.print("{\"event\":\"wifi_connecting\",\"ssid\":\"");
-  Serial.print(WIFI_SSID);
-  Serial.println("\"}");
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
-    delay(250);
-  }
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("{\"event\":\"wifi_connected\",\"ip\":\"");
-    Serial.print(WiFi.localIP());
-    Serial.println("\"}");
-  } else {
-    Serial.println("{\"event\":\"error\",\"message\":\"WiFi connect timed out\"}");
-  }
-}
-
-void connectMqtt() {
-  if (WiFi.status() != WL_CONNECTED) return;
-  mqttClient.setServer(MQTT_BROKER_HOST, MQTT_BROKER_PORT);
-  Serial.print("{\"event\":\"mqtt_connecting\",\"broker\":\"");
-  Serial.print(MQTT_BROKER_HOST);
-  Serial.println("\"}");
-  // Client ID must be unique on the broker; bridge's own MAC works well for this.
-  String clientId = "esp_bridge2_" + WiFi.macAddress();
-  if (mqttClient.connect(clientId.c_str())) {
-    Serial.println("{\"event\":\"mqtt_connected\"}");
-  } else {
-    Serial.print("{\"event\":\"error\",\"message\":\"MQTT connect failed\",\"rc\":");
-    Serial.print(mqttClient.state());
-    Serial.println("}");
-  }
-}
 
 // ---------------- Known devices (MAC -> friendly name) ----------------
 struct KnownDevice {
@@ -76,10 +38,7 @@ struct KnownDevice {
 KnownDevice knownDevices[] = {
   {{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01}, "traffic_lights1"}, // PLACEHOLDER - replace with real MAC
   {{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x02}, "train_gate3"},      // PLACEHOLDER - replace with real MAC
-  // TODO: add train_ctrl_c3's MAC here once known (read it via
-  // WiFi.macAddress() in train_ctrl_c3's own setup(), same way this bridge
-  // prints its own MAC below). Until then it will show up as "unknown_<mac>".
-  // {{0x??, 0x??, 0x??, 0x??, 0x??, 0x??}, "train_ctrl_c3"},
+  {{0x84, 0xFC, 0xE6, 0xFD, 0x3A, 0x24}, "train_ctrl_c3"},    // confirmed via bridge_listener.py output
 };
 const int numKnownDevices = sizeof(knownDevices) / sizeof(knownDevices[0]);
 
@@ -103,6 +62,7 @@ const char* reasonToStr(uint8_t reason) {
   switch (reason) {
     case REASON_BOOT: return "boot";
     case REASON_STATE_CHANGE: return "state_change";
+    case REASON_HEARTBEAT: return "heartbeat";
     default: return "unknown_reason";
   }
 }
@@ -157,28 +117,20 @@ void onDataRecv(const uint8_t *mac_addr, const uint8_t *data, int len) {
   Serial.println(); // break out of any accumulated dot-line first
   serializeJson(doc, Serial);
   Serial.println();
-
-  // Also publish the same JSON payload over MQTT, if connected.
-  if (mqttClient.connected()) {
-    String payload;
-    serializeJson(doc, payload);
-    mqttClient.publish(MQTT_TOPIC, payload.c_str());
-  }
 }
 
 void setup() {
   Serial.begin(115200);
   delay(500);
 
-  // WIFI_STA mode is needed for both ESP-NOW and a normal WiFi/MQTT
-  // connection to coexist - ESP-NOW keeps working the same as before.
+  // WIFI_STA mode with no WiFi.begin() call - keeps the radio in a known
+  // state for ESP-NOW without ever associating to an access point, so the
+  // bridge stays on ESP-NOW's default channel and never conflicts with
+  // sender devices. No router/internet dependency at all.
   WiFi.mode(WIFI_STA);
   Serial.print("{\"event\":\"boot\",\"bridge_mac\":\"");
   Serial.print(WiFi.macAddress());
   Serial.println("\"}");
-
-  connectWiFi();
-  connectMqtt();
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("{\"event\":\"error\",\"message\":\"ESP-NOW init failed\"}");
@@ -198,18 +150,5 @@ void loop() {
   if (millis() - lastActivity >= 10000 && millis() - lastDot >= 10000) {
     lastDot = millis();
     Serial.print(".");
-  }
-
-  // Keep the MQTT connection alive; reconnect if it drops.
-  if (WiFi.status() == WL_CONNECTED) {
-    if (!mqttClient.connected()) {
-      static unsigned long lastReconnectAttempt = 0;
-      if (millis() - lastReconnectAttempt > 5000) {
-        lastReconnectAttempt = millis();
-        connectMqtt();
-      }
-    } else {
-      mqttClient.loop();
-    }
   }
 }

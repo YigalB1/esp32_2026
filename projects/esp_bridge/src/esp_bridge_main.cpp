@@ -36,9 +36,10 @@ struct KnownDevice {
 };
 
 KnownDevice knownDevices[] = {
-  {{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01}, "traffic_lights1"}, // PLACEHOLDER - replace with real MAC
   {{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x02}, "train_gate3"},      // PLACEHOLDER - replace with real MAC
   {{0x84, 0xFC, 0xE6, 0xFD, 0x3A, 0x24}, "train_ctrl_c3"},    // confirmed via bridge_listener.py output
+  {{0x5C, 0xCF, 0x7F, 0x9A, 0xE9, 0xAB}, "ramzor"},           // Wemos traffic light, confirmed via listener output
+  {{0xCC, 0xDB, 0xA7, 0x6A, 0x19, 0xA8}, "train_ctrl_esp32_dev"}, // ESP32-DOIT single-motor train controller, confirmed via listener output
 };
 const int numKnownDevices = sizeof(knownDevices) / sizeof(knownDevices[0]);
 

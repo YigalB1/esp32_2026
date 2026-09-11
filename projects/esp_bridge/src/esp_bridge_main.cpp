@@ -19,9 +19,17 @@
 // devices, looks up the sender's MAC in a known-devices table to get a
 // friendly name, and forwards each message as one JSON line over USB Serial.
 //
-// NOTE: this firmware currently only RECEIVES over ESP-NOW - there is no
-// send path back out. If/when commands need to be relayed to devices like
-// train_ctrl_c3, that capability doesn't exist here yet.
+// UPDATE: the bridge now also SENDS. It reads JSON command lines from USB
+// Serial (from the dashboard) and forwards them over ESP-NOW to a named
+// device. Expected format:
+//   {"cmd":"train_command","device":"train_ctrl_esp32_dev","mode":"manual",
+//    "running":true,"direction":1,"speed":180}
+//   {"cmd":"train_command","device":"train_ctrl_esp32_dev","mode":"auto"}
+// "device" must match a name in knownDevices[] below. Because sending
+// requires the target's MAC to already be a registered ESP-NOW peer (not
+// just known for display purposes), every entry in knownDevices[] is now
+// registered as a peer at boot, not only devices we've received a real
+// message from yet.
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -57,6 +65,16 @@ String lookupDeviceName(const uint8_t *mac) {
     }
   }
   return "unknown_" + macToHex(mac);
+}
+
+// Reverse lookup: friendly name -> MAC pointer, or nullptr if not found.
+const uint8_t* lookupDeviceMac(const String &name) {
+  for (int i = 0; i < numKnownDevices; i++) {
+    if (name.equals(knownDevices[i].name)) {
+      return knownDevices[i].mac;
+    }
+  }
+  return nullptr;
 }
 
 const char* reasonToStr(uint8_t reason) {
@@ -120,6 +138,74 @@ void onDataRecv(const uint8_t *mac_addr, const uint8_t *data, int len) {
   Serial.println();
 }
 
+// ---------------- Outgoing commands (Serial -> ESP-NOW) ----------------
+
+void sendTrainCommand(const String &deviceName, JsonDocument &cmdDoc) {
+  const uint8_t *mac = lookupDeviceMac(deviceName);
+  if (mac == nullptr) {
+    Serial.println();
+    Serial.print("{\"event\":\"error\",\"message\":\"unknown target device for command: ");
+    Serial.print(deviceName);
+    Serial.println("\"}");
+    return;
+  }
+
+  EspNowMessage msg;
+  memset(&msg, 0, sizeof(msg));
+  msg.type = MSG_TRAIN_COMMAND;
+
+  String modeStr = cmdDoc["mode"] | "auto";
+  msg.payload.trainCommand.mode = modeStr.equals("manual") ? MODE_MANUAL : MODE_AUTO;
+  msg.payload.trainCommand.running = (cmdDoc["running"] | false) ? 1 : 0;
+  msg.payload.trainCommand.direction = (int8_t)(cmdDoc["direction"] | 0);
+  msg.payload.trainCommand.speed = (uint8_t)(cmdDoc["speed"] | 0);
+
+  esp_err_t result = esp_now_send(mac, (uint8_t *)&msg, sizeof(msg));
+
+  Serial.println();
+  Serial.print("{\"event\":\"command_sent\",\"device\":\"");
+  Serial.print(deviceName);
+  Serial.print("\",\"ok\":");
+  Serial.print(result == ESP_OK ? "true" : "false");
+  Serial.println("}");
+}
+
+// Reads whatever's available on Serial, one line at a time, without
+// blocking the rest of loop(). Buffers a partial line across calls.
+void pollSerialCommands() {
+  static String lineBuf;
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\n') {
+      lineBuf.trim();
+      if (lineBuf.length() > 0) {
+        JsonDocument doc;
+        DeserializationError err = deserializeJson(doc, lineBuf);
+        if (err) {
+          Serial.println();
+          Serial.print("{\"event\":\"error\",\"message\":\"bad command JSON: ");
+          Serial.print(err.c_str());
+          Serial.println("\"}");
+        } else {
+          String cmd = doc["cmd"] | "";
+          if (cmd.equals("train_command")) {
+            String deviceName = doc["device"] | "";
+            sendTrainCommand(deviceName, doc);
+          } else {
+            Serial.println();
+            Serial.print("{\"event\":\"error\",\"message\":\"unknown cmd: ");
+            Serial.print(cmd);
+            Serial.println("\"}");
+          }
+        }
+      }
+      lineBuf = "";
+    } else if (c != '\r') {
+      lineBuf += c;
+    }
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(500);
@@ -139,11 +225,28 @@ void setup() {
   }
 
   esp_now_register_recv_cb(onDataRecv);
+
+  // Register every known device as a peer at boot - required to be able to
+  // SEND to them (receiving doesn't need this, but sending does).
+  for (int i = 0; i < numKnownDevices; i++) {
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, knownDevices[i].mac, 6);
+    peerInfo.channel = 0;
+    peerInfo.encrypt = false;
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+      Serial.print("{\"event\":\"error\",\"message\":\"failed to add peer: ");
+      Serial.print(knownDevices[i].name);
+      Serial.println("\"}");
+    }
+  }
+
   Serial.println("{\"event\":\"ready\"}");
   lastActivity = millis();
 }
 
 void loop() {
+  pollSerialCommands();
+
   // Idle indicator: print a single "." (no newline) every 10 seconds of
   // silence. Resets on any real ESP-NOW message, so dots only accumulate
   // during genuine idle time, not mixed in with message output.

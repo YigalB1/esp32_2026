@@ -103,6 +103,7 @@ event_queue: "queue.Queue[dict]" = queue.Queue()
 log_queue: "queue.Queue[str]" = queue.Queue()
 port_status_queue: "queue.Queue[str]" = queue.Queue()   # listener -> GUI: "connected to COMx"
 port_override_queue: "queue.Queue[str]" = queue.Queue() # GUI -> listener: "use this port instead"
+command_queue: "queue.Queue[dict]" = queue.Queue()      # GUI -> listener: outgoing command dict, written as one JSON line to the bridge
 mqtt_connected = threading.Event()
 
 
@@ -257,6 +258,20 @@ def bridge_listener_thread():
             except queue.Empty:
                 pass
 
+            # Drain any outgoing commands from the GUI and write them out,
+            # one JSON line per command, same framing the bridge's
+            # pollSerialCommands() expects.
+            try:
+                while True:
+                    cmd = command_queue.get_nowait()
+                    try:
+                        ser.write((json.dumps(cmd) + "\n").encode("utf-8"))
+                        log(f"(sent) {cmd}")
+                    except (serial.SerialException, OSError) as e:
+                        log(f"Could not send command (will not retry): {e}")
+            except queue.Empty:
+                pass
+
             raw = ser.readline()
 
             if not raw:
@@ -362,6 +377,11 @@ class Dashboard(tk.Tk):
         self.active_since = {}   # slot id -> start of current unbroken "alive" streak
         self.traffic_state = None
         self.train_data = {}
+        self.train_device_name = None  # raw device name of whichever train controller is reporting in - target for outgoing commands
+        self.control_mode = "auto"     # "auto" or "manual" - dashboard's own toggle state
+        self.manual_running = False
+        self.manual_direction = 1      # -1 = left/backward, 1 = right/forward
+        self.manual_speed_level = 5    # 0-10 dial
         self.log_lines: deque[str] = deque(maxlen=LOG_MAX_LINES)
         self.log_visible = False
 
@@ -419,12 +439,54 @@ class Dashboard(tk.Tk):
 
         tc_frame = ttk.LabelFrame(self, text="Train Control")
         tc_frame.pack(fill="x", **pad)
+
+        mode_row = ttk.Frame(tc_frame)
+        mode_row.pack(fill="x", padx=8, pady=(4, 0))
+        ttk.Label(mode_row, text="Mode:").pack(side="left")
+        self.mode_button = ttk.Button(mode_row, text="Auto", command=self._toggle_mode, width=10)
+        self.mode_button.pack(side="left", padx=8)
+
         self.direction_label = ttk.Label(tc_frame, text="Direction: --", font=("Segoe UI", 11))
         self.direction_label.pack(anchor="w", padx=8, pady=4)
         self.speed_label = ttk.Label(tc_frame, text="Speed: --", font=("Segoe UI", 11))
         self.speed_label.pack(anchor="w", padx=8, pady=4)
         self.location_label = ttk.Label(tc_frame, text="Location: --", font=("Segoe UI", 11))
         self.location_label.pack(anchor="w", padx=8, pady=4)
+
+        # --- Manual Control panel: hidden until Manual mode is selected ---
+        self.manual_frame = ttk.LabelFrame(self, text="Manual Control")
+        # not packed yet - _toggle_mode() does that when Manual is selected
+
+        start_stop_row = ttk.Frame(self.manual_frame)
+        start_stop_row.pack(fill="x", padx=8, pady=8)
+        self.start_button = tk.Button(start_stop_row, text="Start", width=12, height=2,
+                                       command=self._on_start)
+        self.start_button.pack(side="left", padx=(0, 8))
+        self.stop_button = tk.Button(start_stop_row, text="Stop", width=12, height=2,
+                                      command=self._on_stop)
+        self.stop_button.pack(side="left")
+
+        speed_row = ttk.Frame(self.manual_frame)
+        speed_row.pack(fill="x", padx=8, pady=8)
+        ttk.Label(speed_row, text="Speed:").pack(side="left")
+        self.speed_scale = ttk.Scale(speed_row, from_=0, to=10, orient="horizontal",
+                                      command=self._on_speed_change, length=220)
+        self.speed_scale.set(self.manual_speed_level)
+        self.speed_scale.pack(side="left", padx=8)
+        self.speed_value_label = ttk.Label(speed_row, text=str(self.manual_speed_level), width=3)
+        self.speed_value_label.pack(side="left")
+
+        direction_row = ttk.Frame(self.manual_frame)
+        direction_row.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Label(direction_row, text="Direction:").pack(side="left")
+        self.left_button = tk.Button(direction_row, text="< Left", width=10,
+                                      command=lambda: self._on_direction(-1))
+        self.left_button.pack(side="left", padx=8)
+        self.right_button = tk.Button(direction_row, text="Right >", width=10,
+                                       command=lambda: self._on_direction(1))
+        self.right_button.pack(side="left")
+
+        self._update_manual_button_colors()
 
         # --- Listener log panel (hidden by default) + Exit ---
         button_row = ttk.Frame(self)
@@ -463,6 +525,84 @@ class Dashboard(tk.Tk):
         chosen = self.port_combo.get()
         if chosen:
             port_override_queue.put(chosen)
+
+    # ---------------- Manual control ----------------
+    def _send_train_command(self):
+        """Sends the dashboard's current full desired state as one command.
+        Always a complete snapshot (mode/running/direction/speed), never a
+        partial delta - simpler for the device firmware to apply."""
+        if not self.train_device_name:
+            self._log_local("No train controller has reported in yet - can't address a command.")
+            return
+        speed_255 = round(self.manual_speed_level * 255 / 10)
+        cmd = {
+            "cmd": "train_command",
+            "device": self.train_device_name,
+            "mode": self.control_mode,
+            "running": self.manual_running if self.control_mode == "manual" else False,
+            "direction": self.manual_direction,
+            "speed": speed_255,
+        }
+        command_queue.put(cmd)
+
+    def _log_local(self, text):
+        # For UI-only notices that don't come through the listener thread's log().
+        log(text)
+
+    def _toggle_mode(self):
+        if self.control_mode == "auto":
+            self.control_mode = "manual"
+            self.mode_button.config(text="Manual")
+            self.manual_frame.pack(fill="x", padx=12, pady=8)
+            self.geometry("760x820")
+        else:
+            self.control_mode = "auto"
+            self.mode_button.config(text="Auto")
+            self.manual_running = False
+            self.manual_frame.pack_forget()
+            self.geometry("480x700")
+        self._update_manual_button_colors()
+        self._send_train_command()
+
+    def _on_start(self):
+        self.manual_running = True
+        self._update_manual_button_colors()
+        self._send_train_command()
+
+    def _on_stop(self):
+        self.manual_running = False
+        self._update_manual_button_colors()
+        self._send_train_command()
+
+    def _on_speed_change(self, value_str):
+        self.manual_speed_level = round(float(value_str))
+        self.speed_value_label.config(text=str(self.manual_speed_level))
+        if self.manual_running:
+            self._send_train_command()
+
+    def _on_direction(self, direction):
+        self.manual_direction = direction
+        self._update_manual_button_colors()
+        if self.manual_running:
+            self._send_train_command()
+
+    def _update_manual_button_colors(self):
+        # Start/Stop: the currently-true one is colored, the other stays default.
+        if self.manual_running:
+            self.start_button.config(bg="#4caf50", fg="white")
+            self.stop_button.config(bg="SystemButtonFace", fg="black")
+        else:
+            self.start_button.config(bg="SystemButtonFace", fg="black")
+            self.stop_button.config(bg="#e53935", fg="white")
+
+        # Direction: highlight whichever is selected.
+        if self.manual_direction < 0:
+            self.left_button.config(bg="#90caf9")
+            self.right_button.config(bg="SystemButtonFace")
+        else:
+            self.left_button.config(bg="SystemButtonFace")
+            self.right_button.config(bg="#90caf9")
+
 
     # ---------------- Data handling ----------------
     def _poll_queues(self):
@@ -518,6 +658,7 @@ class Dashboard(tk.Tk):
         if slot_id == "ramzor" and mtype == "traffic_light":
             self.traffic_state = msg.get("state")
         elif slot_id == "train_ctrl" and mtype == "train_control":
+            self.train_device_name = device  # raw name - needed to address outgoing commands
             self.train_data = {
                 "direction": msg.get("direction"),
                 "speed": msg.get("speed"),

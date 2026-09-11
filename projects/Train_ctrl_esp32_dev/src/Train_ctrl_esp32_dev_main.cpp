@@ -11,11 +11,11 @@
 // Pin map (see DESIGN.md):
 //   M1_IN1 -> GPIO19   (DRV8871 IN1, PWM)
 //   M1_IN2 -> GPIO23   (DRV8871 IN2, PWM)
-//   LED3   -> GPIO13   (stopped / red)
-//   LED4   -> GPIO25   (forward / green)
-//   LED5   -> GPIO26   (backward / yellow)
+//   LED3   -> GPIO13   (stopped / red)   - active-LOW
+//   LED4   -> GPIO25   (forward / green) - active-LOW
+//   LED5   -> GPIO26   (backward / yellow) - active-LOW
 //
-// Direction convention (payload.trainControl.direction):
+// Direction convention (payload.trainControl.direction / trainCommand.direction):
 //   -1 = backward, 0 = stop, 1 = forward
 //
 // Bridge peer MAC: CC:DB:A7:69:97:DC
@@ -25,9 +25,18 @@
 //      it as an ESP-NOW peer on the bridge side).
 //   2. Send one ESP-NOW announcement (MSG_TRAIN_CONTROL, REASON_BOOT).
 //   3. Flash all LEDs for 2 seconds.
-//   4. Run an endless Motor 1 self-test loop (same shape as train_ctrl_c3):
-//      forward ramp 0->100% over 30s, brake/pause 2s,
-//      backward ramp 0->100% over 30s, brake/pause 2s, repeat.
+//   4. Enter MODE_AUTO: run an endless Motor 1 self-test loop (forward
+//      ramp 0->100% over 30s, brake/pause 2s, backward ramp 0->100% over
+//      30s, brake/pause 2s, repeat) until commanded otherwise.
+//
+// Control modes (see MSG_TRAIN_COMMAND in EspNowProtocol.h):
+//   MODE_AUTO   - run the self-test loop above (default at boot).
+//   MODE_MANUAL - drive exactly what the dashboard last commanded
+//                 (running/direction/speed). If no command arrives for
+//                 MANUAL_WATCHDOG_MS while in this mode, the motor is
+//                 force-stopped as a fail-safe (stays in MODE_MANUAL -
+//                 it does not silently revert to MODE_AUTO; the dashboard
+//                 must explicitly switch back).
 //
 // Liveness: sends a REASON_HEARTBEAT message every HEARTBEAT_INTERVAL_MS
 // (see EspNowTiming.h) reporting current direction/speed, independent of
@@ -70,11 +79,26 @@ static const uint32_t RAMP_DURATION_MS = 30000; // 0 -> 100% over 30s
 static const uint32_t BRAKE_PAUSE_MS   = 2000;  // pause between ramps
 
 // ---------------------------------------------------------------------
+// Manual mode watchdog: if no MSG_TRAIN_COMMAND arrives for this long
+// while in MODE_MANUAL, force-stop the motor as a fail-safe.
+// ---------------------------------------------------------------------
+static const uint32_t MANUAL_WATCHDOG_MS = 5000;
+
+// ---------------------------------------------------------------------
 // Current reported state (used both for driving hardware and for
 // whatever the next heartbeat/state-change message reports)
 // ---------------------------------------------------------------------
 static int8_t  currentDirection = 0; // -1/0/1
 static uint8_t currentSpeed = 0;     // 0-255
+
+// ---------------------------------------------------------------------
+// Control mode + manual command state
+// ---------------------------------------------------------------------
+static uint8_t controlMode = MODE_AUTO; // one of ControlMode
+static bool    manualRunning = false;
+static int8_t  manualDirection = 0;
+static uint8_t manualSpeed = 0;
+static uint32_t lastManualCommandMs = 0;
 
 // ---------------------------------------------------------------------
 // Self-test state machine
@@ -137,6 +161,7 @@ void driveMotor(int8_t direction, uint8_t speed) {
 
 void sendEspNowMessage(int8_t direction, uint8_t speed, EspNowReason reason) {
   EspNowMessage msg;
+  memset(&msg, 0, sizeof(msg));
   msg.type = MSG_TRAIN_CONTROL;
   msg.payload.trainControl.direction = direction;
   msg.payload.trainControl.speed = speed;
@@ -157,13 +182,70 @@ void onEspNowDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
   }
 }
 
+// Handles an incoming MSG_TRAIN_COMMAND from the bridge (originally from
+// the dashboard). Switches mode and/or updates the manual drive targets.
+void onEspNowDataRecv(const uint8_t *mac_addr, const uint8_t *data, int len) {
+  if (len < 1 || (size_t)len > sizeof(EspNowMessage)) {
+    return;
+  }
+  EspNowMessage msg;
+  memset(&msg, 0, sizeof(msg));
+  memcpy(&msg, data, len);
+
+  if (msg.type != MSG_TRAIN_COMMAND) {
+    return; // not for us / not a command this firmware understands
+  }
+
+  uint8_t newMode = msg.payload.trainCommand.mode;
+  lastManualCommandMs = millis();
+
+  if (newMode == MODE_AUTO) {
+    if (controlMode != MODE_AUTO) {
+      // Just switched into auto - restart the self-test cleanly rather
+      // than resuming from a stale elapsed-time calculation.
+      selfTestState = ST_FORWARD_RAMP;
+      selfTestStateStartMs = millis();
+    }
+    controlMode = MODE_AUTO;
+    manualRunning = false;
+  } else {
+    controlMode = MODE_MANUAL;
+    manualRunning = (msg.payload.trainCommand.running != 0);
+    manualDirection = msg.payload.trainCommand.direction;
+    manualSpeed = msg.payload.trainCommand.speed;
+    if (!manualRunning) {
+      driveMotor(0, 0);
+    } else {
+      driveMotor(manualDirection, manualSpeed);
+    }
+  }
+
+  // Confirm the new state back to the dashboard immediately, rather than
+  // waiting for the next heartbeat.
+  sendEspNowMessage(currentDirection, currentSpeed, REASON_STATE_CHANGE);
+}
+
 // Called every loop() iteration - fires a heartbeat if due, independent
-// of whatever the self-test state machine is doing.
+// of whatever mode/state machine is currently driving the motor.
 void checkHeartbeat() {
   uint32_t now = millis();
   if (now - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
     lastHeartbeatMs = now;
     sendEspNowMessage(currentDirection, currentSpeed, REASON_HEARTBEAT);
+  }
+}
+
+// Fail-safe: if in MODE_MANUAL and no command has arrived for
+// MANUAL_WATCHDOG_MS, force-stop the motor. Stays in MODE_MANUAL - only
+// the dashboard explicitly switching back to MODE_AUTO changes the mode.
+void checkManualWatchdog() {
+  if (controlMode != MODE_MANUAL || !manualRunning) {
+    return;
+  }
+  if (millis() - lastManualCommandMs >= MANUAL_WATCHDOG_MS) {
+    manualRunning = false;
+    driveMotor(0, 0);
+    sendEspNowMessage(currentDirection, currentSpeed, REASON_STATE_CHANGE);
   }
 }
 
@@ -181,7 +263,7 @@ void flashAllLeds(uint32_t durationMs) {
 // Advances the self-test state machine by one loop() tick. Non-blocking:
 // computes ramp speed from elapsed time rather than sleeping, so
 // checkHeartbeat() (called separately every loop() iteration) never gets
-// starved by a long delay().
+// starved by a long delay(). Only called while controlMode == MODE_AUTO.
 void updateSelfTest() {
   uint32_t elapsed = millis() - selfTestStateStartMs;
 
@@ -254,6 +336,7 @@ void setup() {
     while (true) { delay(1000); }
   }
   esp_now_register_send_cb(onEspNowDataSent);
+  esp_now_register_recv_cb(onEspNowDataRecv);
 
   esp_now_peer_info_t peerInfo = {};
   memcpy(peerInfo.peer_addr, bridgeAddress, 6);
@@ -275,6 +358,12 @@ void setup() {
 }
 
 void loop() {
-  updateSelfTest();
+  if (controlMode == MODE_AUTO) {
+    updateSelfTest();
+  } else {
+    checkManualWatchdog();
+    // Manual driving happens directly in onEspNowDataRecv() when a
+    // command arrives - nothing to do here between commands.
+  }
   checkHeartbeat();
 }

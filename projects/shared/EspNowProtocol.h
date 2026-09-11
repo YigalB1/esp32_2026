@@ -26,6 +26,15 @@
 //    it just starts working once senders add periodic heartbeat sends.
 //    ACTION REQUIRED: copy this file into the traffic-light and bridge
 //    projects as well.
+//  - Added MSG_TRAIN_COMMAND, ControlMode, and the trainCommand payload -
+//    the first message type that flows DOWN (dashboard -> bridge -> a
+//    device) rather than up. Lets the dashboard switch a train controller
+//    between MODE_AUTO (run its own programmed behavior, e.g. the
+//    self-test loop) and MODE_MANUAL (drive exactly what's commanded:
+//    running/direction/speed). This does NOT change the size or layout of
+//    the existing trainControl struct - it's a new branch in the union.
+//    ACTION REQUIRED: copy this file into every project that sends OR
+//    receives train commands (train controllers, the bridge).
 
 #pragma once
 #include <stdint.h>
@@ -33,6 +42,7 @@
 enum MsgType : uint8_t {
   MSG_TRAFFIC_LIGHT = 1,
   MSG_TRAIN_CONTROL = 2,
+  MSG_TRAIN_COMMAND = 3, // dashboard -> bridge -> device: switch mode / drive manually
 };
 
 // Generic "reason" codes - why this message was sent. Shared across device
@@ -41,6 +51,12 @@ enum EspNowReason : uint8_t {
   REASON_BOOT = 0,         // device just powered on / reset
   REASON_STATE_CHANGE = 1, // the device's reported state changed
   REASON_HEARTBEAT = 2,    // periodic "I'm still alive", no state change
+};
+
+// Which behavior a train controller is currently following.
+enum ControlMode : uint8_t {
+  MODE_AUTO = 0,   // run the device's own programmed behavior (e.g. self-test loop)
+  MODE_MANUAL = 1, // drive exactly what's commanded (running/direction/speed below)
 };
 
 typedef struct {
@@ -58,6 +74,13 @@ typedef struct {
       float   location;   // however you end up encoding position
       uint8_t reason;     // one of EspNowReason (e.g. REASON_BOOT at power-up)
     } trainControl;
+
+    struct {
+      uint8_t mode;      // one of ControlMode
+      uint8_t running;   // 0 = stopped, 1 = running - only meaningful in MODE_MANUAL
+      int8_t  direction; // -1/0/1, same convention as trainControl - only meaningful if running
+      uint8_t speed;     // 0-255 - only meaningful if running
+    } trainCommand;
   } payload;
 
 } EspNowMessage;

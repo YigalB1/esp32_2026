@@ -62,6 +62,26 @@ use — not used by this board's active circuitry, but noted for reference.
   ramp/brake steps — a blocking delay could otherwise starve the
   heartbeat schedule.
 
+## Control mode (Auto / Manual) and watchdog
+- The dashboard can switch this board between `MODE_AUTO` (run the
+  self-test loop above) and `MODE_MANUAL` (drive exactly what's
+  commanded: running/direction/speed), via `MSG_TRAIN_COMMAND` sent
+  dashboard -> bridge -> board.
+- **Watchdog design split:** the dashboard is the "brain" and owns the
+  *policy* of how long is too long without contact (`watchdogSeconds`,
+  sent with every command, default 20 minutes, user-adjustable in the
+  dashboard). This board is the only thing still running once the link
+  is actually down, though, so it's the one that has to enforce the
+  *mechanism* — if no command arrives within that window, in **either**
+  mode, the motor is force-stopped and the self-test (if in `MODE_AUTO`)
+  is paused until a fresh command arrives.
+- Because the watchdog now applies to `MODE_AUTO` too, the dashboard has
+  to keep "checking in" periodically even while a board is just running
+  its own self-test unattended — see the dashboard's keepalive loop.
+- Every command (mode switch or manual drive change) gets an immediate
+  `REASON_STATE_CHANGE` confirmation back, rather than waiting for the
+  next heartbeat.
+
 ## Motor control
 - Fast-decay drive via DRV8871 IN1/IN2 (PWM carried directly on the input
   pins, same style as `train_ctrl_c3`'s TB6612 driver).

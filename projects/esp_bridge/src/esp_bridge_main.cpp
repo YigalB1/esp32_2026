@@ -159,6 +159,7 @@ void sendTrainCommand(const String &deviceName, JsonDocument &cmdDoc) {
   msg.payload.trainCommand.running = (cmdDoc["running"] | false) ? 1 : 0;
   msg.payload.trainCommand.direction = (int8_t)(cmdDoc["direction"] | 0);
   msg.payload.trainCommand.speed = (uint8_t)(cmdDoc["speed"] | 0);
+  msg.payload.trainCommand.watchdogSeconds = (uint16_t)(cmdDoc["watchdog_seconds"] | 0);
 
   esp_err_t result = esp_now_send(mac, (uint8_t *)&msg, sizeof(msg));
 

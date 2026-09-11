@@ -35,6 +35,16 @@
 //    the existing trainControl struct - it's a new branch in the union.
 //    ACTION REQUIRED: copy this file into every project that sends OR
 //    receives train commands (train controllers, the bridge).
+//  - Added watchdogSeconds to trainCommand. Design split: the DEVICE is
+//    the only thing still running once the link is down, so it's the
+//    only thing that can actually enforce a cutoff (mechanism) - but the
+//    THRESHOLD is decided and owned by the dashboard (policy), sent with
+//    every command rather than hardcoded in firmware. Applies in both
+//    MODE_AUTO and MODE_MANUAL - the dashboard is expected to keep
+//    "checking in" periodically (well under this threshold) in either
+//    mode, not just while manually driving.
+//    ACTION REQUIRED: copy this file into every project that sends OR
+//    receives train commands (train controllers, the bridge).
 
 #pragma once
 #include <stdint.h>
@@ -76,10 +86,14 @@ typedef struct {
     } trainControl;
 
     struct {
-      uint8_t mode;      // one of ControlMode
-      uint8_t running;   // 0 = stopped, 1 = running - only meaningful in MODE_MANUAL
-      int8_t  direction; // -1/0/1, same convention as trainControl - only meaningful if running
-      uint8_t speed;     // 0-255 - only meaningful if running
+      uint8_t mode;             // one of ControlMode
+      uint8_t running;          // 0 = stopped, 1 = running - only meaningful in MODE_MANUAL
+      int8_t  direction;        // -1/0/1, same convention as trainControl - only meaningful if running
+      uint8_t speed;            // 0-255 - only meaningful if running
+      uint16_t watchdogSeconds; // dashboard-set: seconds without a command before
+                                 // the device fail-safes (stops the motor). Applies
+                                 // in both MODE_AUTO and MODE_MANUAL. 0 = leave the
+                                 // device's current watchdog value unchanged.
     } trainCommand;
   } payload;
 

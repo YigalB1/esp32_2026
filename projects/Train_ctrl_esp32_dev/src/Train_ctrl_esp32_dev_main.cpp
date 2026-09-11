@@ -32,11 +32,16 @@
 // Control modes (see MSG_TRAIN_COMMAND in EspNowProtocol.h):
 //   MODE_AUTO   - run the self-test loop above (default at boot).
 //   MODE_MANUAL - drive exactly what the dashboard last commanded
-//                 (running/direction/speed). If no command arrives for
-//                 MANUAL_WATCHDOG_MS while in this mode, the motor is
-//                 force-stopped as a fail-safe (stays in MODE_MANUAL -
-//                 it does not silently revert to MODE_AUTO; the dashboard
-//                 must explicitly switch back).
+//                 (running/direction/speed).
+//
+// Watchdog: the dashboard is the "brain" and owns the policy of how long
+// is too long without contact - it sends the threshold (watchdogSeconds)
+// with every command. This device is the only thing still running once
+// the link is actually down, though, so it's the one that has to enforce
+// the cutoff: if no MSG_TRAIN_COMMAND arrives for watchdogMs, in EITHER
+// mode, the motor is force-stopped and the self-test (if in MODE_AUTO) is
+// paused until a fresh command arrives. Defaults to 20 minutes at boot,
+// before the dashboard has ever sent a value.
 //
 // Liveness: sends a REASON_HEARTBEAT message every HEARTBEAT_INTERVAL_MS
 // (see EspNowTiming.h) reporting current direction/speed, independent of
@@ -79,10 +84,11 @@ static const uint32_t RAMP_DURATION_MS = 30000; // 0 -> 100% over 30s
 static const uint32_t BRAKE_PAUSE_MS   = 2000;  // pause between ramps
 
 // ---------------------------------------------------------------------
-// Manual mode watchdog: if no MSG_TRAIN_COMMAND arrives for this long
-// while in MODE_MANUAL, force-stop the motor as a fail-safe.
+// Watchdog: threshold is owned by the dashboard (sent with every
+// command via watchdogSeconds); this is just the boot-time default,
+// used until the dashboard has sent a value at all.
 // ---------------------------------------------------------------------
-static const uint32_t MANUAL_WATCHDOG_MS = 5000;
+static uint32_t watchdogMs = 20UL * 60UL * 1000UL; // 20 minutes
 
 // ---------------------------------------------------------------------
 // Current reported state (used both for driving hardware and for
@@ -98,7 +104,8 @@ static uint8_t controlMode = MODE_AUTO; // one of ControlMode
 static bool    manualRunning = false;
 static int8_t  manualDirection = 0;
 static uint8_t manualSpeed = 0;
-static uint32_t lastManualCommandMs = 0;
+static uint32_t lastCommandMs = 0;   // last time ANY MSG_TRAIN_COMMAND arrived, either mode
+static bool     watchdogTripped = false;
 
 // ---------------------------------------------------------------------
 // Self-test state machine
@@ -197,12 +204,20 @@ void onEspNowDataRecv(const uint8_t *mac_addr, const uint8_t *data, int len) {
   }
 
   uint8_t newMode = msg.payload.trainCommand.mode;
-  lastManualCommandMs = millis();
+  bool wasTripped = watchdogTripped;
+
+  lastCommandMs = millis();
+  watchdogTripped = false; // any command, either mode, counts as contact
+
+  if (msg.payload.trainCommand.watchdogSeconds > 0) {
+    watchdogMs = (uint32_t)msg.payload.trainCommand.watchdogSeconds * 1000UL;
+  }
 
   if (newMode == MODE_AUTO) {
-    if (controlMode != MODE_AUTO) {
-      // Just switched into auto - restart the self-test cleanly rather
-      // than resuming from a stale elapsed-time calculation.
+    if (controlMode != MODE_AUTO || wasTripped) {
+      // Just switched into auto (or resuming after a watchdog trip) -
+      // restart the self-test cleanly rather than resuming from a stale
+      // elapsed-time calculation.
       selfTestState = ST_FORWARD_RAMP;
       selfTestStateStartMs = millis();
     }
@@ -235,14 +250,18 @@ void checkHeartbeat() {
   }
 }
 
-// Fail-safe: if in MODE_MANUAL and no command has arrived for
-// MANUAL_WATCHDOG_MS, force-stop the motor. Stays in MODE_MANUAL - only
-// the dashboard explicitly switching back to MODE_AUTO changes the mode.
-void checkManualWatchdog() {
-  if (controlMode != MODE_MANUAL || !manualRunning) {
-    return;
+// Fail-safe, applies in BOTH modes: if no MSG_TRAIN_COMMAND has arrived
+// for watchdogMs (dashboard-set policy - see EspNowProtocol.h), force-stop
+// the motor and pause the self-test if one was running. Stays tripped
+// (and stays in whatever controlMode it was in) until a fresh command
+// arrives - onEspNowDataRecv() clears watchdogTripped and, if resuming
+// MODE_AUTO, restarts the self-test cleanly.
+void checkWatchdog() {
+  if (watchdogTripped) {
+    return; // already tripped - nothing to do until a new command clears it
   }
-  if (millis() - lastManualCommandMs >= MANUAL_WATCHDOG_MS) {
+  if (millis() - lastCommandMs >= watchdogMs) {
+    watchdogTripped = true;
     manualRunning = false;
     driveMotor(0, 0);
     sendEspNowMessage(currentDirection, currentSpeed, REASON_STATE_CHANGE);
@@ -349,6 +368,7 @@ void setup() {
   // Boot announce
   sendEspNowMessage(0, 0, REASON_BOOT);
   lastHeartbeatMs = millis(); // don't fire a heartbeat immediately after boot announce
+  lastCommandMs = millis();   // don't let the watchdog trip before the dashboard has ever connected
 
   // Flash all LEDs for 2s (one-time, before the non-blocking loop starts)
   flashAllLeds(2000);
@@ -358,12 +378,11 @@ void setup() {
 }
 
 void loop() {
-  if (controlMode == MODE_AUTO) {
+  checkWatchdog();
+  if (!watchdogTripped && controlMode == MODE_AUTO) {
     updateSelfTest();
-  } else {
-    checkManualWatchdog();
-    // Manual driving happens directly in onEspNowDataRecv() when a
-    // command arrives - nothing to do here between commands.
   }
+  // Manual driving happens directly in onEspNowDataRecv() when a command
+  // arrives - nothing to do here between commands, in either mode.
   checkHeartbeat();
 }

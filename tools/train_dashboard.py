@@ -274,6 +274,20 @@ def bridge_listener_thread():
 
             raw = ser.readline()
 
+            # Bridge's own "I'm alive" status ping - independent of whether
+            # any real device traffic arrived this iteration (ser.readline()
+            # paces this loop at up to ~1s via its own timeout=1, so this
+            # still fires reliably on its own schedule during idle stretches,
+            # not just piggybacked on whatever a device's heartbeat cadence
+            # happens to be).
+            now = time.time()
+            if now - last_heartbeat >= BRIDGE_HEARTBEAT_INTERVAL:
+                last_heartbeat = now
+                try:
+                    mqtt_client.publish(STATUS_TOPIC, json.dumps({"device": "bridge", "type": "heartbeat"}))
+                except Exception as e:
+                    log(f"(mqtt publish error) {e}")
+
             if not raw:
                 if time.time() - last_data_time > IDLE_RECONNECT_SECONDS:
                     log(f"No data for over {IDLE_RECONNECT_SECONDS}s - reconnecting to {port}...")
@@ -283,14 +297,6 @@ def bridge_listener_thread():
                 continue
 
             last_data_time = time.time()
-
-            now = time.time()
-            if now - last_heartbeat >= BRIDGE_HEARTBEAT_INTERVAL:
-                last_heartbeat = now
-                try:
-                    mqtt_client.publish(STATUS_TOPIC, json.dumps({"device": "bridge", "type": "heartbeat"}))
-                except Exception as e:
-                    log(f"(mqtt publish error) {e}")
 
             line = raw.decode("utf-8", errors="ignore").strip()
             if not line:
@@ -370,7 +376,7 @@ class Dashboard(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Train Dashboard")
-        self.geometry("480x700")
+        self.geometry("760x820")  # Manual is the default panel - see control_mode below
         self.resizable(False, True)
 
         self.last_seen = {}
@@ -378,16 +384,21 @@ class Dashboard(tk.Tk):
         self.traffic_state = None
         self.train_data = {}
         self.train_device_name = None  # raw device name of whichever train controller is reporting in - target for outgoing commands
-        self.control_mode = "auto"     # "auto" or "manual" - dashboard's own toggle state
+        self.control_mode = "manual"   # "manual" (default panel shown) / "auto" - dashboard's own UI state
+        self.mode_command_sent = False # becomes True only after the user explicitly takes a mode/control action -
+                                        # nothing is sent to the device until then, so opening the dashboard never
+                                        # yanks a device out of whatever it's already doing (e.g. mid self-test)
         self.manual_running = False
         self.manual_direction = 1      # -1 = left/backward, 1 = right/forward
         self.manual_speed_level = 5    # 0-10 dial
+        self.watchdog_minutes = 20     # dashboard-owned policy, sent with every command - user-adjustable
         self.log_lines: deque[str] = deque(maxlen=LOG_MAX_LINES)
         self.log_visible = False
 
         self._build_ui()
         self.after(200, self._poll_queues)
         self.after(500, self._refresh_status)
+        self.after(2000, self._keepalive)
 
     def _build_ui(self):
         pad = {"padx": 12, "pady": 8}
@@ -443,8 +454,27 @@ class Dashboard(tk.Tk):
         mode_row = ttk.Frame(tc_frame)
         mode_row.pack(fill="x", padx=8, pady=(4, 0))
         ttk.Label(mode_row, text="Mode:").pack(side="left")
-        self.mode_button = ttk.Button(mode_row, text="Auto", command=self._toggle_mode, width=10)
-        self.mode_button.pack(side="left", padx=8)
+        self.manual_mode_button = tk.Button(mode_row, text="Manual", width=10,
+                                             command=lambda: self._select_mode("manual"))
+        self.manual_mode_button.pack(side="left", padx=4)
+        self.auto_mode_button = tk.Button(mode_row, text="Auto", width=10,
+                                           command=lambda: self._select_mode("auto"))
+        self.auto_mode_button.pack(side="left", padx=4)
+        self.remote_mode_button = tk.Button(mode_row, text="Remote (TBD)", width=12,
+                                             command=lambda: self._select_mode("remote"))
+        self.remote_mode_button.pack(side="left", padx=4)
+
+        watchdog_row = ttk.Frame(tc_frame)
+        watchdog_row.pack(fill="x", padx=8, pady=(4, 0))
+        ttk.Label(watchdog_row, text="Watchdog (min):").pack(side="left")
+        self.watchdog_spinbox = ttk.Spinbox(watchdog_row, from_=1, to=180, width=5,
+                                             command=self._on_watchdog_change)
+        self.watchdog_spinbox.set(self.watchdog_minutes)
+        self.watchdog_spinbox.pack(side="left", padx=8)
+        # Also catch manual typing + Enter/focus-out, not just the spinner arrows.
+        self.watchdog_spinbox.bind("<Return>", lambda e: self._on_watchdog_change())
+        self.watchdog_spinbox.bind("<FocusOut>", lambda e: self._on_watchdog_change())
+        ttk.Label(watchdog_row, text="(applies to both Auto and Manual)", foreground="gray").pack(side="left", padx=4)
 
         self.direction_label = ttk.Label(tc_frame, text="Direction: --", font=("Segoe UI", 11))
         self.direction_label.pack(anchor="w", padx=8, pady=4)
@@ -455,7 +485,9 @@ class Dashboard(tk.Tk):
 
         # --- Manual Control panel: hidden until Manual mode is selected ---
         self.manual_frame = ttk.LabelFrame(self, text="Manual Control")
-        # not packed yet - _toggle_mode() does that when Manual is selected
+        # Manual is the default panel - packed immediately below. This is a
+        # UI-only default: nothing is sent to the device until the user
+        # explicitly clicks a mode/control button (see mode_command_sent).
 
         start_stop_row = ttk.Frame(self.manual_frame)
         start_stop_row.pack(fill="x", padx=8, pady=8)
@@ -471,10 +503,10 @@ class Dashboard(tk.Tk):
         ttk.Label(speed_row, text="Speed:").pack(side="left")
         self.speed_scale = ttk.Scale(speed_row, from_=0, to=10, orient="horizontal",
                                       command=self._on_speed_change, length=220)
-        self.speed_scale.set(self.manual_speed_level)
         self.speed_scale.pack(side="left", padx=8)
         self.speed_value_label = ttk.Label(speed_row, text=str(self.manual_speed_level), width=3)
         self.speed_value_label.pack(side="left")
+        self.speed_scale.set(self.manual_speed_level)  # after the label exists - .set() fires the command callback immediately
 
         direction_row = ttk.Frame(self.manual_frame)
         direction_row.pack(fill="x", padx=8, pady=(0, 8))
@@ -486,7 +518,11 @@ class Dashboard(tk.Tk):
                                        command=lambda: self._on_direction(1))
         self.right_button.pack(side="left")
 
+        self.manual_frame.pack(fill="x", padx=12, pady=8)
+        self.geometry("760x820")
+
         self._update_manual_button_colors()
+        self._update_mode_button_colors()
 
         # --- Listener log panel (hidden by default) + Exit ---
         button_row = ttk.Frame(self)
@@ -521,6 +557,20 @@ class Dashboard(tk.Tk):
         elif ports:
             self.port_combo.set(ports[0])
 
+    def _keepalive(self):
+        # The device force-stops if no command arrives within its watchdog
+        # window (dashboard-set, default 20 min - see watchdog_minutes).
+        # Applies in both modes now, not just Manual, so this keepalive
+        # also has to run in Auto - otherwise a device left running Auto
+        # for longer than the watchdog window would halt on its own even
+        # though nothing is actually wrong. Only starts once the user has
+        # taken an explicit mode/control action (mode_command_sent) - so
+        # simply having the dashboard open never overrides a device's
+        # current behavior on its own.
+        if self.mode_command_sent and self.train_device_name:
+            self._send_train_command()
+        self.after(2000, self._keepalive)
+
     def _apply_port_override(self):
         chosen = self.port_combo.get()
         if chosen:
@@ -529,8 +579,8 @@ class Dashboard(tk.Tk):
     # ---------------- Manual control ----------------
     def _send_train_command(self):
         """Sends the dashboard's current full desired state as one command.
-        Always a complete snapshot (mode/running/direction/speed), never a
-        partial delta - simpler for the device firmware to apply."""
+        Always a complete snapshot (mode/running/direction/speed/watchdog),
+        never a partial delta - simpler for the device firmware to apply."""
         if not self.train_device_name:
             self._log_local("No train controller has reported in yet - can't address a command.")
             return
@@ -542,6 +592,7 @@ class Dashboard(tk.Tk):
             "running": self.manual_running if self.control_mode == "manual" else False,
             "direction": self.manual_direction,
             "speed": speed_255,
+            "watchdog_seconds": int(self.watchdog_minutes) * 60,
         }
         command_queue.put(cmd)
 
@@ -549,34 +600,57 @@ class Dashboard(tk.Tk):
         # For UI-only notices that don't come through the listener thread's log().
         log(text)
 
-    def _toggle_mode(self):
-        if self.control_mode == "auto":
-            self.control_mode = "manual"
-            self.mode_button.config(text="Manual")
+    def _select_mode(self, mode):
+        if mode == "remote":
+            # Not implemented yet - just tell the user, don't touch any
+            # state or send anything, so whichever mode was actually
+            # active stays correctly highlighted.
+            self._log_local("Remote control isn't implemented yet.")
+            return
+
+        self.control_mode = mode
+        self.mode_command_sent = True  # first explicit action - keepalive can start sending now
+
+        if mode == "manual":
             self.manual_frame.pack(fill="x", padx=12, pady=8)
             self.geometry("760x820")
-        else:
-            self.control_mode = "auto"
-            self.mode_button.config(text="Auto")
+        else:  # auto
             self.manual_running = False
             self.manual_frame.pack_forget()
             self.geometry("480x700")
+
         self._update_manual_button_colors()
+        self._update_mode_button_colors()
         self._send_train_command()
+
+    def _on_watchdog_change(self):
+        try:
+            value = int(float(self.watchdog_spinbox.get()))
+        except ValueError:
+            return  # ignore invalid/partial typing - keeps the last good value
+        value = max(1, min(180, value))
+        self.watchdog_minutes = value
+        # Push the new watchdog value immediately if a mode's already active,
+        # rather than waiting for the next keepalive tick.
+        if self.mode_command_sent:
+            self._send_train_command()
 
     def _on_start(self):
         self.manual_running = True
+        self.mode_command_sent = True
         self._update_manual_button_colors()
         self._send_train_command()
 
     def _on_stop(self):
         self.manual_running = False
+        self.mode_command_sent = True
         self._update_manual_button_colors()
         self._send_train_command()
 
     def _on_speed_change(self, value_str):
         self.manual_speed_level = round(float(value_str))
-        self.speed_value_label.config(text=str(self.manual_speed_level))
+        if hasattr(self, "speed_value_label"):
+            self.speed_value_label.config(text=str(self.manual_speed_level))
         if self.manual_running:
             self._send_train_command()
 
@@ -602,6 +676,23 @@ class Dashboard(tk.Tk):
         else:
             self.left_button.config(bg="SystemButtonFace")
             self.right_button.config(bg="#90caf9")
+
+    def _update_mode_button_colors(self):
+        # Whichever mode is actually active gets green; the others stay
+        # default. Remote is never highlighted here - it's TBD and never
+        # becomes self.control_mode (see _select_mode).
+        active_bg = "#4caf50"
+        default_bg = "SystemButtonFace"
+        active_fg = "white"
+        default_fg = "black"
+
+        self.manual_mode_button.config(
+            bg=active_bg if self.control_mode == "manual" else default_bg,
+            fg=active_fg if self.control_mode == "manual" else default_fg)
+        self.auto_mode_button.config(
+            bg=active_bg if self.control_mode == "auto" else default_bg,
+            fg=active_fg if self.control_mode == "auto" else default_fg)
+        self.remote_mode_button.config(bg=default_bg, fg=default_fg)
 
 
     # ---------------- Data handling ----------------

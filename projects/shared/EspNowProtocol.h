@@ -45,6 +45,22 @@
 //    mode, not just while manually driving.
 //    ACTION REQUIRED: copy this file into every project that sends OR
 //    receives train commands (train controllers, the bridge).
+//  - Added MSG_CAMERA_DETECT and the cameraDetect payload - the first
+//    message type from the esp32_eye/ESP32-CAM camera-based detection
+//    devices (device -> bridge). Reuses EspNowReason as-is: REASON_BOOT
+//    for the boot announcement, REASON_STATE_CHANGE whenever the device's
+//    empty/object classification flips, REASON_HEARTBEAT on the same
+//    periodic timer as other device types. Deliberately minimal for now -
+//    just the current state - since the devices are still desk-testing
+//    detection logic. Calibration push (dashboard -> device) and any
+//    health/confidence reporting (noise floor, threshold - for flagging a
+//    camera as unreliable due to lighting) are expected to be separate
+//    future message types once that work starts, not fields bolted onto
+//    this one.
+//    Since this lives in one shared location and every project includes
+//    it by relative path, no copying is needed - just make sure any
+//    checked-out copies (if you have more than one clone) pick up this
+//    updated file before building esp32_eye or esp_bridge.
 
 #pragma once
 #include <stdint.h>
@@ -53,6 +69,7 @@ enum MsgType : uint8_t {
   MSG_TRAFFIC_LIGHT = 1,
   MSG_TRAIN_CONTROL = 2,
   MSG_TRAIN_COMMAND = 3, // dashboard -> bridge -> device: switch mode / drive manually
+  MSG_CAMERA_DETECT = 4, // camera device -> bridge: empty/object state
 };
 
 // Generic "reason" codes - why this message was sent. Shared across device
@@ -67,6 +84,14 @@ enum EspNowReason : uint8_t {
 enum ControlMode : uint8_t {
   MODE_AUTO = 0,   // run the device's own programmed behavior (e.g. self-test loop)
   MODE_MANUAL = 1, // drive exactly what's commanded (running/direction/speed below)
+};
+
+// Whether a camera-based detection device currently sees the track as
+// clear or occupied. Kept separate from EspNowReason - state is "what is
+// true right now", reason is "why you're hearing about it this time".
+enum DetectState : uint8_t {
+  DETECT_EMPTY = 0,
+  DETECT_OBJECT = 1,
 };
 
 typedef struct {
@@ -95,6 +120,11 @@ typedef struct {
                                  // in both MODE_AUTO and MODE_MANUAL. 0 = leave the
                                  // device's current watchdog value unchanged.
     } trainCommand;
+
+    struct {
+      uint8_t state;  // one of DetectState - empty or object, right now
+      uint8_t reason; // one of EspNowReason
+    } cameraDetect;
   } payload;
 
 } EspNowMessage;

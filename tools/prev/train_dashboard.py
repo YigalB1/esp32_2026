@@ -97,10 +97,8 @@ SENSOR_POSITIONS = {
 
 DEVICE_SLOTS = [
     {"id": "bridge", "label": "Bridge", "match": lambda d: d == "bridge"},
-    {"id": "ramzor", "label": "Ramzor 1 (Traffic Light)",
-     "match": lambda d: d.lower() == "ramzor" or "traffic" in d.lower()},
-    {"id": "ramzor2", "label": "Ramzor 2 (Traffic Light)",
-     "match": lambda d: d.lower() == "ramzor2"},
+    {"id": "ramzor", "label": "Ramzor (Traffic Light)",
+     "match": lambda d: "traffic" in d.lower() or "ramzor" in d.lower()},
     {"id": "train_ctrl", "label": "Train Control",
      "match": lambda d: "train" in d.lower()},
     {"id": "distance_sensor_1", "label": "Distance Sensor 1",
@@ -465,12 +463,6 @@ class Dashboard(tk.Tk):
         self.last_seen = {}
         self.active_since = {}   # slot id -> start of current unbroken "alive" streak
         self.traffic_state = None
-        self.traffic_state2 = None
-        # Tracks the previous state of each Ramzor so train control only
-        # fires on a color CHANGE (the light turning red/green), not on
-        # every repeated status update reporting the same color.
-        self._prev_traffic_state = None
-        self._prev_traffic_state2 = None
         self.train_data = {}
         self.distance_data = {}
         self.distance_data2 = {}
@@ -558,48 +550,16 @@ class Dashboard(tk.Tk):
         self.layout_canvas.pack(pady=10)
         self._draw_track_layout()
 
-        tl_frame = ttk.LabelFrame(right_col, text="Ramzor Traffic Lights")
+        tl_frame = ttk.LabelFrame(right_col, text="Ramzor Traffic Light")
         tl_frame.pack(fill="x", **pad)
-        tl_row = ttk.Frame(tl_frame)
-        tl_row.pack(pady=10)
-
-        # Both lights side by side, each with its own "use this one to
-        # control the train" checkbox - a Ramzor only affects the train
-        # while its checkbox is on. Red = stop, green = go, yellow is
-        # ignored. Fires on the color CHANGING, not on every repeated
-        # update of the same color (see _prev_traffic_state above), and
-        # always uses whatever speed/direction Manual mode currently has
-        # set - it calls the exact same _on_start()/_on_stop() the
-        # Manual Control buttons do, not a separate path.
-        self.ramzor1_control_enabled = tk.BooleanVar(value=False)
-        tl1_col = ttk.Frame(tl_row)
-        tl1_col.pack(side="left", padx=(0, 20))
-        ttk.Label(tl1_col, text="Ramzor 1").pack()
-        self.tl_canvas = tk.Canvas(tl1_col, width=100, height=220, bg="#222", highlightthickness=0)
-        self.tl_canvas.pack(pady=6)
+        self.tl_canvas = tk.Canvas(tl_frame, width=100, height=220, bg="#222", highlightthickness=0)
+        self.tl_canvas.pack(pady=10)
         self.tl_canvas.create_rectangle(20, 10, 80, 210, fill="#111", outline="#555", width=2)
         self.tl_circles = {
             "R": self.tl_canvas.create_oval(30, 20, 70, 60, fill="#400000", outline=""),
             "Y": self.tl_canvas.create_oval(30, 85, 70, 125, fill="#403000", outline=""),
             "G": self.tl_canvas.create_oval(30, 150, 70, 190, fill="#004000", outline=""),
         }
-        ttk.Checkbutton(tl1_col, text="Controls train",
-                        variable=self.ramzor1_control_enabled).pack()
-
-        self.ramzor2_control_enabled = tk.BooleanVar(value=False)
-        tl2_col = ttk.Frame(tl_row)
-        tl2_col.pack(side="left")
-        ttk.Label(tl2_col, text="Ramzor 2").pack()
-        self.tl_canvas2 = tk.Canvas(tl2_col, width=100, height=220, bg="#222", highlightthickness=0)
-        self.tl_canvas2.pack(pady=6)
-        self.tl_canvas2.create_rectangle(20, 10, 80, 210, fill="#111", outline="#555", width=2)
-        self.tl_circles2 = {
-            "R": self.tl_canvas2.create_oval(30, 20, 70, 60, fill="#400000", outline=""),
-            "Y": self.tl_canvas2.create_oval(30, 85, 70, 125, fill="#403000", outline=""),
-            "G": self.tl_canvas2.create_oval(30, 150, 70, 190, fill="#004000", outline=""),
-        }
-        ttk.Checkbutton(tl2_col, text="Controls train",
-                        variable=self.ramzor2_control_enabled).pack()
 
         tc_frame = ttk.LabelFrame(left_col, text="Train Control")
         tc_frame.pack(fill="x", **pad)
@@ -1076,20 +1036,6 @@ class Dashboard(tk.Tk):
         if self.mode_command_sent:
             self._send_train_command()
 
-    def _apply_ramzor_control(self, current_state, prev_state, enabled, label):
-        # Fires train stop/start when a Ramzor's color CHANGES, not on
-        # every repeated update of the same color - returns the state
-        # to remember as "previous" for next time, win or lose.
-        if enabled and current_state != prev_state:
-            if current_state == "R":
-                log(f"({label}) turned red - stopping train.")
-                self._on_stop()
-            elif current_state == "G":
-                log(f"({label}) turned green - starting train.")
-                self._on_start()
-            # "Y" (or any other value) - no action, per spec.
-        return current_state
-
     def _on_start(self):
         self.manual_running = True
         self.mode_command_sent = True
@@ -1215,8 +1161,6 @@ class Dashboard(tk.Tk):
         mtype = msg.get("type")
         if slot_id == "ramzor" and mtype == "traffic_light":
             self.traffic_state = msg.get("state")
-        elif slot_id == "ramzor2" and mtype == "traffic_light":
-            self.traffic_state2 = msg.get("state")
         elif slot_id == "train_ctrl" and mtype == "train_control":
             self.train_device_name = device  # raw name - needed to address outgoing commands
             self.train_data = {
@@ -1295,19 +1239,6 @@ class Dashboard(tk.Tk):
                 "R": "#400000", "Y": "#403000", "G": "#004000"
             }[color]
             self.tl_canvas.itemconfig(circle_id, fill=lit)
-
-        for color, circle_id in self.tl_circles2.items():
-            lit = TRAFFIC_LIGHT_COLORS[color] if self.traffic_state2 == color else {
-                "R": "#400000", "Y": "#403000", "G": "#004000"
-            }[color]
-            self.tl_canvas2.itemconfig(circle_id, fill=lit)
-
-        self._prev_traffic_state = self._apply_ramzor_control(
-            self.traffic_state, self._prev_traffic_state,
-            self.ramzor1_control_enabled.get(), "Ramzor 1")
-        self._prev_traffic_state2 = self._apply_ramzor_control(
-            self.traffic_state2, self._prev_traffic_state2,
-            self.ramzor2_control_enabled.get(), "Ramzor 2")
 
         d = self.train_data
         if d:

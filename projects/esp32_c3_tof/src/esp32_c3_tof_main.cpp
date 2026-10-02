@@ -1,29 +1,47 @@
 // esp32_c3_tof_main.cpp
 //
-// Stage 0: OLED display bring-up only. No sensor, no ESP-NOW yet -
-// just proving the display itself works before anything else is
-// built on top of it.
+// Stage 2: boot confirmation + cm.mm live readout.
+// Boots, confirms display and sensor are both alive by showing "VV"
+// for 5s, then switches to continuous live distance readings.
+// Screen shows cm.mm (compact, readable); Serial logs raw mm
+// (precise, for future ESP-NOW use). Also prints this device's MAC
+// address at boot - needed later for ESP-NOW pairing.
 //
-// Cycles through three placeholder states, 3 seconds each, forever:
-//   1. a placeholder distance number
-//   2. "V" - stands in for "detected"
-//   3. "X" - stands in for "not detected"
+// IMPORTANT: the OLED and the ToF sensor are on TWO SEPARATE I2C
+// buses, on different pins - not sharing a bus. Sharing GPIO5/6
+// between u8g2's software I2C (bit-banging) and the sensor's
+// hardware-I2C comms caused a persistent conflict - the display
+// library appeared to repeatedly grab raw GPIO control of the shared
+// pins on every redraw, cutting the sensor off. Confirmed via
+// extensive testing: bus recovery, pull-ups, and 5V power all failed
+// identically; only physically separating the pins resolved it.
 //
-// I2C pins CONFIRMED by the boot scan: GPIO5 (SDA) / GPIO6 (SCL),
-// device found at address 0x3C. The GPIO8/9 guess (suggested by this
-// board's silkscreen calling out IO8 separately) was wrong.
+// OLED bus: GPIO5 (SDA) / GPIO6 (SCL), address 0x3C - u8g2 software
+// I2C, does NOT use the Wire library or the hardware I2C peripheral
+// at all - pure GPIO bit-banging.
+// ToF bus:  GPIO8 (SDA) / GPIO9 (SCL), address 0x29 - the chip's one
+// hardware I2C controller (ESP32-C3 only has one), used exclusively
+// for the sensor since u8g2 never touches it.
 #define OLED_SDA 5
 #define OLED_SCL 6
-
-// Pins are confirmed now - scan disabled. Flip back to 1 if this
-// ever needs re-diagnosing (e.g. on a differently-wired board).
-#define RUN_I2C_SCAN_AT_BOOT 0
+#define TOF_SDA 8
+#define TOF_SCL 9
 
 #include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
 #include <U8g2lib.h>
 #include <Wire.h>
+#include <Adafruit_VL53L0X.h>
+#include "../../shared/EspNowProtocol.h"
+#include "../../shared/EspNowTiming.h"
 
-U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, OLED_SCL, OLED_SDA);
+// Same bridge MAC the other esp32_2026 devices announce to.
+static uint8_t bridgeMac[6] = {0xCC, 0xDB, 0xA7, 0x69, 0x97, 0xDC};
+
+U8G2_SSD1306_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, /* clock=*/ OLED_SCL, /* data=*/ OLED_SDA, /* reset=*/ U8X8_PIN_NONE);
+Adafruit_VL53L0X tof = Adafruit_VL53L0X();
+bool tofReady = false;
 
 // This panel is physically 72x40 pixels, sitting inside a controller
 // that thinks it's addressing 128x64 - without this offset, anything
@@ -33,63 +51,36 @@ const int PANEL_H = 40;
 const int X_OFFSET = 30;  // (132 - PANEL_W) / 2
 const int Y_OFFSET = 12;  // (64 - PANEL_H) / 2
 
-#if RUN_I2C_SCAN_AT_BOOT
-struct PinPair {
-  int sda;
-  int scl;
-  const char *label;
-};
-
-PinPair scanCandidates[] = {
-  {8, 9, "GPIO8 (SDA) / GPIO9 (SCL)"},
-  {5, 6, "GPIO5 (SDA) / GPIO6 (SCL)"},
-};
-
-String scanResults;  // captured once, re-printed repeatedly so it's never missed
-
-static void scanPins(int sda, int scl, const char *label) {
-  Wire.end();
-  Wire.begin(sda, scl);
-  delay(50);
-
-  scanResults += String("Scanning with ") + label + " ...\n";
-  bool found = false;
-  for (uint8_t addr = 1; addr < 127; addr++) {
-    Wire.beginTransmission(addr);
-    if (Wire.endTransmission() == 0) {
-      char line[32];
-      snprintf(line, sizeof(line), "  Found device at 0x%02X\n", addr);
-      scanResults += line;
-      found = true;
-    }
-  }
-  if (!found) {
-    scanResults += "  Nothing responded on this pin pair\n";
+// Native USB needs an actual connected listener on the other end. If
+// the Serial Monitor is closed but the code keeps printing, the
+// output buffer fills up and further Serial.print/println calls
+// BLOCK waiting for room that will never free - stalling all of
+// loop() (sensor reading, display update, everything) even though
+// neither actually depends on a PC being connected.
+//
+// The standard "if (Serial)" connection check turned out NOT to
+// reliably detect a closed monitor on this chip/core - so instead of
+// inferring connection state, check the actual thing that causes the
+// freeze directly: whether there's room in the output buffer to
+// write without blocking. If there isn't, skip the print entirely
+// rather than wait for space that may never free up.
+static void dbgPrintln(const String &s) {
+  if (Serial.availableForWrite() >= (int)(s.length() + 2)) {
+    Serial.println(s);
   }
 }
-
-// Runs the scan exactly ONCE - repeated Wire.end()/begin() cycling
-// (e.g. calling this from loop()) is unreliable on this core and
-// throws "bus not initialized" / NULL buffer errors after a pass or
-// two. Results are captured to a string and re-printed from loop()
-// instead, so missing the message once (e.g. due to a reset) isn't
-// a problem without needing to re-touch the I2C bus at all.
-static void runBootI2cScan() {
-  scanResults = "I2C scan starting...\n";
-  for (auto &c : scanCandidates) {
-    scanPins(c.sda, c.scl, c.label);
+static void dbgPrint(const String &s) {
+  if (Serial.availableForWrite() >= (int)s.length()) {
+    Serial.print(s);
   }
-  scanResults += "I2C scan done.\n";
-  Wire.end();  // leave a clean bus state before u8g2 initializes it
 }
-#endif
 
 static void showCentered(const char *text) {
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_logisoso22_tr);
   int w = u8g2.getStrWidth(text);
   int x = X_OFFSET + (PANEL_W - w) / 2;
-  int y = Y_OFFSET + PANEL_H / 2 + 10;  // rough vertical centering for this font's baseline
+  int y = Y_OFFSET + PANEL_H / 2 + 14;  // rough vertical centering for this font's baseline
   u8g2.drawStr(x, y, text);
   u8g2.sendBuffer();
 }
@@ -106,75 +97,182 @@ static bool every(unsigned long intervalMs, unsigned long &lastTime) {
   return false;
 }
 
+// Lightweight "is this address responding right now" check on the
+// ToF's own bus (Wire) - a single beginTransmission/endTransmission,
+// not a bus reset. Safe to call every loop pass.
+static bool i2cPresent(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  return Wire.endTransmission() == 0;
+}
+
+const uint8_t TOF_ADDR = 0x29;
+String bootStatus;  // captured once in setup(), reprinted periodically so it's never missed
+
+bool espNowReady = false;
+uint16_t lastReportedMm = 0;
+bool lastReportedValid = false;
+const uint16_t REPORT_CHANGE_THRESHOLD_MM = 5;  // send a STATE_CHANGE only past this much drift,
+                                                  // not on every single 200ms sample
+
+static bool initEspNow() {
+  if (esp_now_init() != ESP_OK) {
+    dbgPrintln("ESP-NOW init failed");
+    return false;
+  }
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, bridgeMac, 6);
+  peer.channel = 0;  // use whatever channel this device's WiFi is already on
+  peer.encrypt = false;
+  if (esp_now_add_peer(&peer) != ESP_OK) {
+    dbgPrintln("Failed to add ESP-NOW peer (bridge)");
+    return false;
+  }
+  return true;
+}
+
+static void sendDistanceMessage(uint16_t distanceMm, bool valid, uint8_t reason) {
+  if (!espNowReady) return;
+  EspNowMessage msg = {};
+  msg.type = MSG_DISTANCE_SENSOR;
+  msg.payload.distanceSensor.distanceMm = distanceMm;
+  msg.payload.distanceSensor.valid = valid ? 1 : 0;
+  msg.payload.distanceSensor.reason = reason;
+  esp_now_send(bridgeMac, (uint8_t *)&msg, sizeof(msg));
+}
+
 void setup() {
   Serial.begin(115200);
   delay(3000);  // give native-USB CDC a moment to actually connect
 
-  Serial.println("=== BOOT ===");
-#if RUN_I2C_SCAN_AT_BOOT
-  Serial.println("RUN_I2C_SCAN_AT_BOOT = 1 (scan enabled)");
-#else
-  Serial.println("RUN_I2C_SCAN_AT_BOOT = 0 (scan disabled)");
-#endif
+  dbgPrintln("=== BOOT ===");
 
-#if RUN_I2C_SCAN_AT_BOOT
-  runBootI2cScan();
-#endif
+  // Needed to register this device by MAC on the bridge side later
+  // for ESP-NOW. Doesn't join any network - just reads the chip's
+  // own factory MAC.
+  WiFi.mode(WIFI_STA);
+  String macAddr = WiFi.macAddress();
+  dbgPrint("MAC Address: ");
+  dbgPrintln(macAddr);
 
-  u8g2.begin();
+  espNowReady = initEspNow();
+  dbgPrintln(espNowReady ? "ESP-NOW ready" : "ESP-NOW init FAILED");
+
+  // OLED: u8g2 software I2C manages GPIO5/6 directly - no Wire.begin()
+  // needed or wanted here, to keep these pins exclusively under u8g2's
+  // control with zero interference from the Wire library.
+  bool oledReady = u8g2.begin();
+  dbgPrintln(oledReady ? "u8g2.begin() succeeded" : "u8g2.begin() FAILED");
   u8g2.setContrast(255);
-  u8g2.setBusClock(400000);
 
-  Serial.println("=== setup() complete, entering loop() ===");
+  if (oledReady) {
+    showCentered("Hi");  // unconditional display-alive check, independent of sensor status
+    delay(2000);
+  }
+
+  // ToF: separate pins, the chip's one hardware I2C peripheral -
+  // u8g2 never touches this bus at all.
+  Wire.begin(TOF_SDA, TOF_SCL);
+
+  tofReady = false;
+  if (i2cPresent(TOF_ADDR)) {
+    tofReady = tof.begin(TOF_ADDR, false, &Wire);
+    dbgPrintln(tofReady ? "VL53L0X ready" : "VL53L0X present but init failed");
+  } else {
+    dbgPrintln("VL53L0X not detected at boot - loop() will keep checking");
+  }
+
+  bootStatus = String("MAC: ") + macAddr +
+               " | OLED: " + (oledReady ? "OK" : "FAILED") +
+               " | ToF@boot: " + (tofReady ? "OK" : "not found");
+
+  sendDistanceMessage(0, false, REASON_BOOT);
+
+  if (oledReady && tofReady) {
+    // Both confirmed alive - hold this for 5s before live readings
+    // start. This is a one-time boot-phase delay, not inside the
+    // ongoing loop, so it doesn't block anything that matters.
+    dbgPrintln("Display + sensor both alive - showing VV confirmation");
+    showCentered("VV");
+    delay(5000);
+  } else if (!tofReady) {
+    showCentered("N/C");
+  }
+
+  dbgPrintln("=== setup() complete, entering loop() ===");
 }
 
-// Non-blocking display cycle: instead of delay()-ing through each
-// state in sequence (which would block Serial handling, sensor
-// polling, or ESP-NOW sends once those exist), track elapsed time
-// and advance state without ever halting loop() itself.
-enum DisplayState { SHOW_DISTANCE, SHOW_DETECTED, SHOW_NOT_DETECTED };
-DisplayState displayState = SHOW_DISTANCE;
-unsigned long lastStateChange = 0;
-const unsigned long STATE_INTERVAL_MS = 3000;
-
-#if RUN_I2C_SCAN_AT_BOOT
-unsigned long lastScanPrint = 0;
-const unsigned long SCAN_PRINT_INTERVAL_MS = 3000;
-#endif
-
 unsigned long lastHeartbeat = 0;
+unsigned long lastMeasurement = 0;
+unsigned long lastEspNowHeartbeat = 0;
+const unsigned long MEASURE_INTERVAL_MS = 200;
+// Uses the shared EspNowTiming.h constant (20s) rather than a hardcoded
+// value, so this device heartbeats on the same cadence as every other
+// sender (train_ctrl_c3, ramzor, etc.) - was previously a mismatched
+// hardcoded 30s.
 
 void loop() {
-  unsigned long now = millis();
-
   if (every(1000, lastHeartbeat)) {
-    Serial.println("I am alive");
+    dbgPrintln("I am alive - " + bootStatus);
   }
 
-#if RUN_I2C_SCAN_AT_BOOT
-  if (now - lastScanPrint >= SCAN_PRINT_INTERVAL_MS) {
-    lastScanPrint = now;
-    Serial.println("---- I2C scan results (captured once at boot) ----");
-    Serial.print(scanResults);
+  if (every(HEARTBEAT_INTERVAL_MS, lastEspNowHeartbeat)) {
+    sendDistanceMessage(lastReportedMm, lastReportedValid, REASON_HEARTBEAT);
   }
-#endif
 
-  if (now - lastStateChange >= STATE_INTERVAL_MS) {
-    lastStateChange = now;
+  if (every(MEASURE_INTERVAL_MS, lastMeasurement)) {
+    bool present = i2cPresent(TOF_ADDR);
 
-    switch (displayState) {
-      case SHOW_DISTANCE:
-        showCentered("123mm");  // placeholder distance - real sensor comes later
-        displayState = SHOW_DETECTED;
-        break;
-      case SHOW_DETECTED:
-        showCentered("V");  // placeholder for "detected"
-        displayState = SHOW_NOT_DETECTED;
-        break;
-      case SHOW_NOT_DETECTED:
-        showCentered("X");  // placeholder for "not detected"
-        displayState = SHOW_DISTANCE;
-        break;
+    if (present && !tofReady) {
+      // Just (re)appeared - run its proper init before trusting it.
+      tofReady = tof.begin(TOF_ADDR, false, &Wire);
+      dbgPrintln(tofReady ? "VL53L0X (re)connected" : "VL53L0X present but init failed");
+    } else if (!present && tofReady) {
+      tofReady = false;
+      dbgPrintln("VL53L0X connection lost");
+    }
+
+    if (tofReady) {
+      VL53L0X_RangingMeasurementData_t measure;
+      tof.rangingTest(&measure, false);  // blocks briefly (~30-50ms) - fine at this rate
+
+      char buf[16];
+      if (measure.RangeStatus != 4) {  // 4 = out of range / invalid reading
+        int mm = measure.RangeMilliMeter;
+        // Screen shows cm.mm (2 digits cm, 1 digit mm) for readability -
+        // Serial keeps raw mm as the authoritative value, e.g. for
+        // future ESP-NOW use where full precision matters more than
+        // a compact human-readable string.
+        snprintf(buf, sizeof(buf), "%d.%dcm", mm / 10, mm % 10);
+        char distMsg[32];
+        snprintf(distMsg, sizeof(distMsg), "Distance: %d mm", mm);
+        dbgPrintln(distMsg);
+
+        int drift = mm - (int)lastReportedMm;
+        if (drift < 0) drift = -drift;
+        if (!lastReportedValid || drift >= REPORT_CHANGE_THRESHOLD_MM) {
+          sendDistanceMessage((uint16_t)mm, true, REASON_STATE_CHANGE);
+          lastReportedMm = (uint16_t)mm;
+          lastReportedValid = true;
+        }
+      } else {
+        snprintf(buf, sizeof(buf), "----");
+        dbgPrintln("Distance: out of range");
+        if (lastReportedValid) {
+          sendDistanceMessage(0, false, REASON_STATE_CHANGE);
+          lastReportedValid = false;
+        }
+      }
+      showCentered(buf);
+    } else {
+      static int counter = 0;
+      counter++;
+      char buf[8];
+      snprintf(buf, sizeof(buf), "%d", counter);
+      showCentered(buf);  // incrementing number proves the display is
+                           // still actively updating, not just frozen
+      char notConnMsg[48];
+      snprintf(notConnMsg, sizeof(notConnMsg), "VL53L0X: not connected (display counter: %d)", counter);
+      dbgPrintln(notConnMsg);
     }
   }
 }

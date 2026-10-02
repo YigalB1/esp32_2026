@@ -61,6 +61,22 @@
 //    it by relative path, no copying is needed - just make sure any
 //    checked-out copies (if you have more than one clone) pick up this
 //    updated file before building esp32_eye or esp_bridge.
+//  - Added MSG_DISTANCE_SENSOR and the distanceSensor payload - the first
+//    message type from the esp32_c3_tof VL53L0X-based distance gate
+//    devices (device -> bridge). Unlike cameraDetect (a bare empty/object
+//    flag), this carries the actual measured distance in mm, since a
+//    ranging sensor's real value is more useful than collapsing it to
+//    binary at the source - the bridge/dashboard can derive
+//    presence/thresholding from the raw number as needed. `valid`
+//    distinguishes "0mm because nothing's in range" from a genuine
+//    near-zero reading. Reuses EspNowReason as-is: REASON_BOOT,
+//    REASON_STATE_CHANGE (sent when the reading changes by more than a
+//    device-side threshold, not on every single sample),
+//    REASON_HEARTBEAT on the same HEARTBEAT_INTERVAL_MS cadence defined
+//    in EspNowTiming.h as other device types.
+//    ACTION REQUIRED: copy this file into the esp32_c3_tof project and
+//    the bridge project (same single-shared-location caveat as above -
+//    just make sure any other checked-out copies pick this up).
 
 #pragma once
 #include <stdint.h>
@@ -70,6 +86,7 @@ enum MsgType : uint8_t {
   MSG_TRAIN_CONTROL = 2,
   MSG_TRAIN_COMMAND = 3, // dashboard -> bridge -> device: switch mode / drive manually
   MSG_CAMERA_DETECT = 4, // camera device -> bridge: empty/object state
+  MSG_DISTANCE_SENSOR = 5, // ToF distance device -> bridge: measured distance in mm
 };
 
 // Generic "reason" codes - why this message was sent. Shared across device
@@ -125,6 +142,12 @@ typedef struct {
       uint8_t state;  // one of DetectState - empty or object, right now
       uint8_t reason; // one of EspNowReason
     } cameraDetect;
+
+    struct {
+      uint16_t distanceMm; // measured distance in mm
+      uint8_t  valid;      // 0 = out of range / no target, 1 = valid reading
+      uint8_t  reason;     // one of EspNowReason
+    } distanceSensor;
   } payload;
 
 } EspNowMessage;

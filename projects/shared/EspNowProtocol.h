@@ -77,6 +77,17 @@
 //    ACTION REQUIRED: copy this file into the esp32_c3_tof project and
 //    the bridge project (same single-shared-location caveat as above -
 //    just make sure any other checked-out copies pick this up).
+//  - Added MSG_TEMPERATURE and the temperature payload - DS18B20 reading
+//    from Train_ctrl_esp32_dev (device -> bridge), mounted under the motor
+//    driver to monitor its heat. `tempCentiC` is hundredths of a degree C
+//    (int16_t, avoids floats over the wire). `valid` distinguishes "sensor
+//    missing or read failed" from a real reading - never send a made-up
+//    number. Reuses EspNowReason as-is: REASON_BOOT at startup,
+//    REASON_STATE_CHANGE when the value moves by 0.5 C or more,
+//    REASON_HEARTBEAT on the normal heartbeat timer.
+//    ACTION REQUIRED: copy this file into Train_ctrl_esp32_dev and the
+//    bridge project (same single-shared-location caveat as above - just
+//    make sure any other checked-out copies pick this up).
 
 #pragma once
 #include <stdint.h>
@@ -87,6 +98,7 @@ enum MsgType : uint8_t {
   MSG_TRAIN_COMMAND = 3, // dashboard -> bridge -> device: switch mode / drive manually
   MSG_CAMERA_DETECT = 4, // camera device -> bridge: empty/object state
   MSG_DISTANCE_SENSOR = 5, // ToF distance device -> bridge: measured distance in mm
+  MSG_TEMPERATURE = 6, // DS18B20 device -> bridge: measured temperature
 };
 
 // Generic "reason" codes - why this message was sent. Shared across device
@@ -148,6 +160,12 @@ typedef struct {
       uint8_t  valid;      // 0 = out of range / no target, 1 = valid reading
       uint8_t  reason;     // one of EspNowReason
     } distanceSensor;
+
+    struct {
+      int16_t tempCentiC; // temperature in hundredths of a degree C
+      uint8_t valid;      // 0 = sensor missing or read failed, 1 = valid reading
+      uint8_t reason;     // one of EspNowReason
+    } temperature;
   } payload;
 
 } EspNowMessage;

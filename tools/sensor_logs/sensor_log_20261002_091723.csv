@@ -1,0 +1,9 @@
+timestamp,sensor_id,distance_mm,valid
+1790952038.587,distance_sensor_1,0,False
+1790952040.876,distance_sensor_1,8191,True
+1790952042.332,distance_sensor_1,0,False
+1790952044.204,distance_sensor_1,161,True
+1790952044.829,distance_sensor_1,102,True
+1790952045.243,distance_sensor_1,64,True
+1790952053.212,distance_sensor_1,64,True
+1790952073.251,distance_sensor_1,64,True

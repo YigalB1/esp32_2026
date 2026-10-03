@@ -278,17 +278,6 @@ def handle_message(msg: dict, mqtt_client: mqtt.Client):
     device = msg.get("device", "unknown")
     mtype = msg.get("type", "unknown")
 
-    # Bridge acknowledgment of a command we sent down. NOT a message from the
-    # device - "ok" only means the packet was handed to the bridge's radio,
-    # not that the device received it. Successes are silent (the "(sent)"
-    # line already shows what went out); failures get a log line. Not
-    # published to MQTT: it carries a "device" field, and the GUI would
-    # otherwise count it as proof that device is alive.
-    if msg.get("event") == "command_sent":
-        if not msg.get("ok"):
-            log(f"(bridge) command to {device} FAILED to leave the radio")
-        return
-
     if mtype == "traffic_light":
         log(f"[{device}] traffic light -> {msg.get('state', '?')}  (reason: {msg.get('reason', '?')})")
     elif mtype == "train_control":
@@ -299,8 +288,6 @@ def handle_message(msg: dict, mqtt_client: mqtt.Client):
             log(f"[{device}] distance -> {msg.get('distance_mm')}mm  (reason: {msg.get('reason', '?')})")
         else:
             log(f"[{device}] distance -> out of range  (reason: {msg.get('reason', '?')})")
-    elif "event" in msg:
-        log(f"(bridge) {msg}")
     elif mtype == "unknown":
         log(f"[{device}] unrecognized message type: {msg}")
     else:
@@ -495,7 +482,6 @@ class Dashboard(tk.Tk):
         self.manual_running = False
         self.manual_direction = 1      # -1 = left/backward, 1 = right/forward
         self.manual_speed_level = 5    # 0-10 dial
-        self._speed_send_pending = False  # slider coalescing - see _on_speed_change
         self.watchdog_minutes = 20     # dashboard-owned policy, sent with every command - user-adjustable
         self.log_lines: deque[str] = deque(maxlen=LOG_MAX_LINES)
         self.log_visible = False
@@ -1117,24 +1103,9 @@ class Dashboard(tk.Tk):
         self._send_train_command()
 
     def _on_speed_change(self, value_str):
-        # ttk.Scale fires this for every pixel of drag, with a float value, so
-        # a single sweep used to emit dozens of identical commands - enough to
-        # overflow the bridge's serial RX buffer ("bad command JSON" errors).
-        # Only act when the rounded 0-10 level actually changes, and coalesce
-        # rapid changes into at most one command per 150 ms (always carrying
-        # the latest level).
-        level = round(float(value_str))
-        if level == self.manual_speed_level:
-            return
-        self.manual_speed_level = level
+        self.manual_speed_level = round(float(value_str))
         if hasattr(self, "speed_value_label"):
-            self.speed_value_label.config(text=str(level))
-        if self.manual_running and not self._speed_send_pending:
-            self._speed_send_pending = True
-            self.after(150, self._flush_speed_send)
-
-    def _flush_speed_send(self):
-        self._speed_send_pending = False
+            self.speed_value_label.config(text=str(self.manual_speed_level))
         if self.manual_running:
             self._send_train_command()
 
@@ -1234,8 +1205,6 @@ class Dashboard(tk.Tk):
             pass  # logging to disk is best-effort, never crash the GUI over it
 
     def _handle_message(self, msg: dict):
-        if "event" in msg:
-            return  # bridge-internal event (boot/ready/error/command_sent), not a device message
         device = msg.get("device", "")
         slot_id = classify_device(device)
         if slot_id is None:

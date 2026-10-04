@@ -191,30 +191,6 @@ def find_esp32_2026_root():
     return None
 
 
-def format_temperature(temp_data: dict, now: float):
-    """Text and color for the Train Control panel's driver-temperature line.
-      - nothing received yet            -> "--" (gray)
-      - fresh and valid                 -> "28.3 C" (black)
-      - fresh but the sensor reports invalid (unplugged / read failed)
-                                        -> "-- (no sensor reading)" (black)
-      - older than DEVICE_OFFLINE_SECONDS (several missed heartbeats)
-                                        -> last value shown in gray with "(old)",
-                                           so a stale number never looks current.
-    The age uses the dashboard's own clock (temp_data["time"] is set when the
-    message ARRIVES), same policy as device liveness elsewhere."""
-    if not temp_data:
-        return "Driver temp: --", "gray"
-    age = now - temp_data.get("time", 0)
-    valid = bool(temp_data.get("valid")) and temp_data.get("temp_c") is not None
-    if age >= DEVICE_OFFLINE_SECONDS:
-        if valid:
-            return f"Driver temp: {float(temp_data['temp_c']):.1f} \u00b0C (old)", "gray"
-        return "Driver temp: --", "gray"
-    if valid:
-        return f"Driver temp: {float(temp_data['temp_c']):.1f} \u00b0C", "black"
-    return "Driver temp: -- (no sensor reading)", "black"
-
-
 def classify_device(raw_name: str):
     for slot in DEVICE_SLOTS:
         if slot["match"](raw_name):
@@ -323,11 +299,6 @@ def handle_message(msg: dict, mqtt_client: mqtt.Client):
             log(f"[{device}] distance -> {msg.get('distance_mm')}mm  (reason: {msg.get('reason', '?')})")
         else:
             log(f"[{device}] distance -> out of range  (reason: {msg.get('reason', '?')})")
-    elif mtype == "temperature":
-        if msg.get("valid"):
-            log(f"[{device}] temperature -> {msg.get('temp_c')} C  (reason: {msg.get('reason', '?')})")
-        else:
-            log(f"[{device}] temperature -> no valid reading  (reason: {msg.get('reason', '?')})")
     elif "event" in msg:
         log(f"(bridge) {msg}")
     elif mtype == "unknown":
@@ -514,7 +485,6 @@ class Dashboard(tk.Tk):
         self._prev_traffic_state = None
         self._prev_traffic_state2 = None
         self.train_data = {}
-        self.temp_data = {}          # latest MSG_TEMPERATURE from the train controller (+ arrival time)
         self.distance_data = {}
         self.distance_data2 = {}
         self.train_device_name = None  # raw device name of whichever train controller is reporting in - target for outgoing commands
@@ -679,8 +649,6 @@ class Dashboard(tk.Tk):
         self.speed_label.pack(anchor="w", padx=8, pady=4)
         self.location_label = ttk.Label(tc_frame, text="Location: --", font=("Segoe UI", 11))
         self.location_label.pack(anchor="w", padx=8, pady=4)
-        self.temp_label = ttk.Label(tc_frame, text="Driver temp: --", font=("Segoe UI", 11), foreground="gray")
-        self.temp_label.pack(anchor="w", padx=8, pady=4)
 
         ds_frame = ttk.LabelFrame(left_col, text="Distance Sensor 1")
         ds_frame.pack(fill="x", **pad)
@@ -1287,12 +1255,6 @@ class Dashboard(tk.Tk):
                 "speed": msg.get("speed"),
                 "location": msg.get("location"),
             }
-        elif slot_id == "train_ctrl" and mtype == "temperature":
-            self.temp_data = {
-                "temp_c": msg.get("temp_c"),
-                "valid": msg.get("valid"),
-                "time": time.time(),   # arrival time on THIS machine - staleness is judged from it
-            }
         elif slot_id == "distance_sensor_1" and mtype == "distance_sensor":
             self.distance_data = {
                 "distance_mm": msg.get("distance_mm"),
@@ -1383,9 +1345,6 @@ class Dashboard(tk.Tk):
             self.direction_label.config(text=f"Direction: {d.get('direction', '--')}")
             self.speed_label.config(text=f"Speed: {d.get('speed', '--')}")
             self.location_label.config(text=f"Location: {d.get('location', '--')}")
-
-        temp_text, temp_color = format_temperature(self.temp_data, time.time())
-        self.temp_label.config(text=temp_text, foreground=temp_color)
 
         # A sensor's LAST reading was being shown (and fed into the
         # train position) forever, even after it went offline - no

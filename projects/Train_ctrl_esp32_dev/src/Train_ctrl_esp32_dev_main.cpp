@@ -53,6 +53,12 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
+#include <math.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
 
 #include "../../shared/EspNowProtocol.h"
 #include "../../shared/EspNowTiming.h"
@@ -65,6 +71,7 @@ static const uint8_t PIN_M1_IN2 = 23;
 static const uint8_t PIN_LED_STOPPED  = 13; // LED3, red
 static const uint8_t PIN_LED_FORWARD  = 25; // LED4, green
 static const uint8_t PIN_LED_BACKWARD = 26; // LED5, yellow
+static const uint8_t PIN_TEMP_SENSOR   = 32; // D32, DS18B20 data (4.7k pull-up to 3.3V)
 
 // PWM (LEDC) channels/config for the motor driver inputs
 static const int PWM_FREQ_HZ   = 20000; // 20kHz, above audible range
@@ -123,6 +130,58 @@ static uint32_t selfTestStateStartMs = 0;
 // Heartbeat scheduling
 // ---------------------------------------------------------------------
 static uint32_t lastHeartbeatMs = 0;
+
+// ---------------------------------------------------------------------
+// DS18B20 temperature sensing. Read on a separate low-priority FreeRTOS
+// task so the blocking ~750ms conversion wait never stalls loop()'s
+// watchdog/heartbeat/motor timing. The task only ever touches the
+// sensor and the queue below - it must NOT call esp_now_send or Serial;
+// loop() owns all sending and all Serial output for this reading.
+// ---------------------------------------------------------------------
+static OneWire oneWire(PIN_TEMP_SENSOR);
+static DallasTemperature tempSensors(&oneWire);
+static QueueHandle_t tempQueue = nullptr;
+
+struct TempReading {
+  float   tempC;
+  uint8_t valid; // 0 = sensor missing or read failed (-127 or the 85.0 power-on default)
+};
+
+static const uint32_t TEMP_SAMPLE_INTERVAL_MS = 5000;
+static const uint32_t TEMP_BOOT_TIMEOUT_MS    = 5000; // how long to wait for a first reading before reporting valid=0 at boot
+
+void tempSensorTask(void *pvParameters) {
+  tempSensors.begin();
+  tempSensors.setWaitForConversion(false); // we drive the wait ourselves with vTaskDelay below
+  for (;;) {
+    tempSensors.requestTemperatures();
+    vTaskDelay(pdMS_TO_TICKS(800)); // 12-bit conversion takes up to ~750ms
+    float c = tempSensors.getTempCByIndex(0);
+
+    TempReading reading;
+    if (c == DEVICE_DISCONNECTED_C || c == 85.0f) {
+      reading.tempC = 0.0f;
+      reading.valid = 0;
+    } else {
+      reading.tempC = c;
+      reading.valid = 1;
+    }
+    xQueueOverwrite(tempQueue, &reading);
+
+    vTaskDelay(pdMS_TO_TICKS(TEMP_SAMPLE_INTERVAL_MS));
+  }
+}
+
+// Latest sample drained from the queue, regardless of whether it was ever sent.
+static TempReading tempLatest = {0.0f, 0};
+
+// Last reading this firmware has actually SENT over ESP-NOW (not just the
+// latest sample) - REASON_STATE_CHANGE compares against this, not against
+// whatever the sensor task last produced.
+static bool    tempBootSent      = false;
+static float   tempLastSentC     = 0.0f;
+static uint8_t tempLastSentValid = 0;
+static uint32_t tempBootDeadlineMs = 0;
 
 // ---------------------------------------------------------------------
 // Helpers
@@ -189,6 +248,21 @@ void onEspNowDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
   }
 }
 
+void sendTemperatureMessage(float tempC, uint8_t valid, EspNowReason reason) {
+  EspNowMessage msg;
+  memset(&msg, 0, sizeof(msg));
+  msg.type = MSG_TEMPERATURE;
+  msg.payload.temperature.tempCentiC = (int16_t)lroundf(tempC * 100.0f);
+  msg.payload.temperature.valid = valid;
+  msg.payload.temperature.reason = reason;
+
+  esp_err_t result = esp_now_send(bridgeAddress, (uint8_t *)&msg, sizeof(msg));
+  if (result != ESP_OK) {
+    Serial.print("ESP-NOW send failed (temperature), err=");
+    Serial.println(result);
+  }
+}
+
 // Handles an incoming MSG_TRAIN_COMMAND from the bridge (originally from
 // the dashboard). Switches mode and/or updates the manual drive targets.
 void onEspNowDataRecv(const uint8_t *mac_addr, const uint8_t *data, int len) {
@@ -247,6 +321,53 @@ void checkHeartbeat() {
   if (now - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
     lastHeartbeatMs = now;
     sendEspNowMessage(currentDirection, currentSpeed, REASON_HEARTBEAT);
+    if (tempBootSent) {
+      sendTemperatureMessage(tempLatest.tempC, tempLatest.valid, REASON_HEARTBEAT);
+      tempLastSentC = tempLatest.tempC;
+      tempLastSentValid = tempLatest.valid;
+    }
+  }
+}
+
+// Called every loop() iteration. Drains the latest sample (if any) from
+// the sensor task's length-1 queue, prints it to Serial, and decides
+// whether it's worth sending: REASON_BOOT for the first reading (or
+// valid=0 if the sensor hasn't answered within TEMP_BOOT_TIMEOUT_MS of
+// boot), then REASON_STATE_CHANGE whenever the value moves 0.5C or more
+// from the last SENT value or validity flips. All ESP-NOW sending and
+// Serial printing for temperature happens here, never in the task.
+void checkTemperature() {
+  TempReading reading;
+  if (xQueueReceive(tempQueue, &reading, 0) == pdTRUE) {
+    tempLatest = reading;
+    Serial.print("DS18B20: ");
+    if (reading.valid) {
+      Serial.print(reading.tempC, 2);
+      Serial.println(" C");
+    } else {
+      Serial.println("invalid/no sensor");
+    }
+
+    if (!tempBootSent) {
+      sendTemperatureMessage(reading.tempC, reading.valid, REASON_BOOT);
+      tempLastSentC = reading.tempC;
+      tempLastSentValid = reading.valid;
+      tempBootSent = true;
+    } else {
+      bool validityChanged = (reading.valid != tempLastSentValid);
+      bool valueChanged = reading.valid && fabsf(reading.tempC - tempLastSentC) >= 0.5f;
+      if (validityChanged || valueChanged) {
+        sendTemperatureMessage(reading.tempC, reading.valid, REASON_STATE_CHANGE);
+        tempLastSentC = reading.tempC;
+        tempLastSentValid = reading.valid;
+      }
+    }
+  } else if (!tempBootSent && millis() >= tempBootDeadlineMs) {
+    // No reading within a few seconds of boot - sensor missing or not wired yet.
+    sendTemperatureMessage(0.0f, 0, REASON_BOOT);
+    tempLastSentC = 0.0f;
+    tempLastSentValid = 0;
+    tempBootSent = true;
   }
 }
 
@@ -370,6 +491,12 @@ void setup() {
   lastHeartbeatMs = millis(); // don't fire a heartbeat immediately after boot announce
   lastCommandMs = millis();   // don't let the watchdog trip before the dashboard has ever connected
 
+  // DS18B20: low-priority background task, no core pinning. loop() owns
+  // all ESP-NOW sending/Serial output for readings - see checkTemperature().
+  tempQueue = xQueueCreate(1, sizeof(TempReading));
+  tempBootDeadlineMs = millis() + TEMP_BOOT_TIMEOUT_MS;
+  xTaskCreate(tempSensorTask, "TempSensor", 4096, nullptr, 1, nullptr);
+
   // Flash all LEDs for 2s (one-time, before the non-blocking loop starts)
   flashAllLeds(2000);
 
@@ -385,4 +512,5 @@ void loop() {
   // Manual driving happens directly in onEspNowDataRecv() when a command
   // arrives - nothing to do here between commands, in either mode.
   checkHeartbeat();
+  checkTemperature();
 }

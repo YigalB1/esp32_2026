@@ -12,10 +12,10 @@ motor, TB6612-style driver), this board drives a **single motor** via an
 Adafruit DRV8871 H-bridge.
 
 ## Active hardware (per schematic `Train_CTRL_2024-06-11_07-31-04`, rev 1.0)
-Only the following are physically populated on this board — everything
-else on the schematic (servo, DS18B20, HC-SR04, I2C expander, speed pot,
-buzzer, second motor header, voltage/current meter, external regulator)
-is present in the design but **not assembled** and out of scope.
+The following are physically populated on this board — everything else on
+the schematic (servo, HC-SR04, I2C expander, speed pot, buzzer, second
+motor header, voltage/current meter, external regulator) is present in
+the design but **not assembled** and out of scope.
 
 | Function | Ref | Notes |
 |---|---|---|
@@ -23,6 +23,7 @@ is present in the design but **not assembled** and out of scope.
 | Motor driver | U3 | Adafruit DRV8871, single H-bridge |
 | Power input | U6 | DC power jack |
 | Status LEDs | LED1/2/3 (silkscreen) → firmware LED3/4/5 | See pin table |
+| Temperature sensor | DS18B20 | Mounted under the motor driver to measure its heat. See pin table + Temperature sensing below. |
 
 ## Pin map
 
@@ -33,6 +34,7 @@ is present in the design but **not assembled** and out of scope.
 | LED3 (stopped / Red) | D13 | Output |
 | LED4 (forward / Green) | D25 | Output |
 | LED5 (backward / Yellow) | D26 | Output |
+| DS18B20 (temperature) | D32 | OneWire data, mounted under the motor driver to measure its heat. Needs a 4.7k pull-up to 3.3V; sensor must be powered from 3.3V (GPIO32 is not 5V tolerant). |
 
 **Known constraint:** GPIO34/35 are input-only on this ESP32 variant and
 cannot drive the original schematic's LED1/LED2 nets — this board's
@@ -79,6 +81,24 @@ pins:
   announcement, flash all LEDs for 2s, then an endless Motor 1 self-test
   loop (forward ramp 0→100% over 30s, brake/pause 2s, backward ramp
   0→100% over 30s, brake/pause 2s, repeat).
+
+## Temperature sensing (DS18B20)
+- Read on a dedicated low-priority FreeRTOS task (priority 1, 4096-byte
+  stack, no core affinity) that requests a conversion, blocks waiting for
+  it, and reads the result every ~5s. The task only touches the sensor
+  and publishes its latest reading into a length-1 queue via
+  `xQueueOverwrite` — it never calls `esp_now_send` or `Serial`, so the
+  ~750ms conversion wait can never stall `loop()`'s watchdog/heartbeat/
+  motor timing.
+- `loop()` drains that queue, prints every reading to Serial, and is the
+  only thing that sends `MSG_TEMPERATURE`: `REASON_BOOT` once the first
+  reading arrives (or with `valid = 0` if nothing arrives within ~5s of
+  boot), `REASON_STATE_CHANGE` when the value moves 0.5C or more from the
+  last value actually sent (or validity flips), and `REASON_HEARTBEAT` on
+  the existing heartbeat timer alongside the `trainControl` heartbeat.
+- A reading of -127C (`DEVICE_DISCONNECTED_C`) or exactly 85.0C (the
+  DS18B20 power-on default, returned when a conversion didn't actually
+  complete) is treated as invalid — never forwarded as a real number.
 
 ## ESP-NOW peer (bridge)
 - Bridge MAC address: `CC:DB:A7:69:97:DC` (same bridge as `train_ctrl_c3`,

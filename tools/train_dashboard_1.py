@@ -191,40 +191,6 @@ def find_esp32_2026_root():
     return None
 
 
-def format_temperature(temp_data: dict, now: float):
-    """Text and color for the Train Control panel's driver-temperature line.
-      - nothing received yet            -> "--" (gray)
-      - fresh and valid                 -> "28.3 C" (black)
-      - fresh but the sensor reports invalid (unplugged / read failed)
-                                        -> "-- (no sensor reading)" (black)
-      - older than DEVICE_OFFLINE_SECONDS (several missed heartbeats)
-                                        -> last value shown in gray with "(old)",
-                                           so a stale number never looks current.
-    The age uses the dashboard's own clock (temp_data["time"] is set when the
-    message ARRIVES), same policy as device liveness elsewhere."""
-    if not temp_data:
-        return "Driver temp: --", "gray"
-    age = now - temp_data.get("time", 0)
-    valid = bool(temp_data.get("valid")) and temp_data.get("temp_c") is not None
-    if age >= DEVICE_OFFLINE_SECONDS:
-        if valid:
-            return f"Driver temp: {float(temp_data['temp_c']):.1f} \u00b0C (old)", "gray"
-        return "Driver temp: --", "gray"
-    if valid:
-        return f"Driver temp: {float(temp_data['temp_c']):.1f} \u00b0C", "black"
-    return "Driver temp: -- (no sensor reading)", "black"
-
-
-def ramzor_display_state(state, last_seen, now):
-    """Which light to SHOW for a Ramzor. One that is not connected (never seen, or
-    silent for DEVICE_OFFLINE_SECONDS) shows NO light, instead of the last color it
-    reported - which would look like a live signal. Display only: the train-control
-    logic still uses the raw last state."""
-    if last_seen is None or now - last_seen >= DEVICE_OFFLINE_SECONDS:
-        return None
-    return state
-
-
 def classify_device(raw_name: str):
     for slot in DEVICE_SLOTS:
         if slot["match"](raw_name):
@@ -312,17 +278,6 @@ def handle_message(msg: dict, mqtt_client: mqtt.Client):
     device = msg.get("device", "unknown")
     mtype = msg.get("type", "unknown")
 
-    # Bridge acknowledgment of a command we sent down. NOT a message from the
-    # device - "ok" only means the packet was handed to the bridge's radio,
-    # not that the device received it. Successes are silent (the "(sent)"
-    # line already shows what went out); failures get a log line. Not
-    # published to MQTT: it carries a "device" field, and the GUI would
-    # otherwise count it as proof that device is alive.
-    if msg.get("event") == "command_sent":
-        if not msg.get("ok"):
-            log(f"(bridge) command to {device} FAILED to leave the radio")
-        return
-
     if mtype == "traffic_light":
         log(f"[{device}] traffic light -> {msg.get('state', '?')}  (reason: {msg.get('reason', '?')})")
     elif mtype == "train_control":
@@ -333,13 +288,6 @@ def handle_message(msg: dict, mqtt_client: mqtt.Client):
             log(f"[{device}] distance -> {msg.get('distance_mm')}mm  (reason: {msg.get('reason', '?')})")
         else:
             log(f"[{device}] distance -> out of range  (reason: {msg.get('reason', '?')})")
-    elif mtype == "temperature":
-        if msg.get("valid"):
-            log(f"[{device}] temperature -> {msg.get('temp_c')} C  (reason: {msg.get('reason', '?')})")
-        else:
-            log(f"[{device}] temperature -> no valid reading  (reason: {msg.get('reason', '?')})")
-    elif "event" in msg:
-        log(f"(bridge) {msg}")
     elif mtype == "unknown":
         log(f"[{device}] unrecognized message type: {msg}")
     else:
@@ -524,7 +472,6 @@ class Dashboard(tk.Tk):
         self._prev_traffic_state = None
         self._prev_traffic_state2 = None
         self.train_data = {}
-        self.temp_data = {}          # latest MSG_TEMPERATURE from the train controller (+ arrival time)
         self.distance_data = {}
         self.distance_data2 = {}
         self.train_device_name = None  # raw device name of whichever train controller is reporting in - target for outgoing commands
@@ -535,7 +482,6 @@ class Dashboard(tk.Tk):
         self.manual_running = False
         self.manual_direction = 1      # -1 = left/backward, 1 = right/forward
         self.manual_speed_level = 5    # 0-10 dial
-        self._speed_send_pending = False  # slider coalescing - see _on_speed_change
         self.watchdog_minutes = 20     # dashboard-owned policy, sent with every command - user-adjustable
         self.log_lines: deque[str] = deque(maxlen=LOG_MAX_LINES)
         self.log_visible = False
@@ -613,9 +559,9 @@ class Dashboard(tk.Tk):
         self._draw_track_layout()
 
         tl_frame = ttk.LabelFrame(right_col, text="Ramzor Traffic Lights")
-        tl_frame.pack(anchor="w", **pad)   # no fill: only as wide as the two lights need, left-aligned
+        tl_frame.pack(fill="x", **pad)
         tl_row = ttk.Frame(tl_frame)
-        tl_row.pack(padx=8, pady=8)
+        tl_row.pack(pady=10)
 
         # Both lights side by side, each with its own "use this one to
         # control the train" checkbox - a Ramzor only affects the train
@@ -627,32 +573,32 @@ class Dashboard(tk.Tk):
         # Manual Control buttons do, not a separate path.
         self.ramzor1_control_enabled = tk.BooleanVar(value=False)
         tl1_col = ttk.Frame(tl_row)
-        tl1_col.pack(side="left", padx=(0, 8))
+        tl1_col.pack(side="left", padx=(0, 20))
         ttk.Label(tl1_col, text="Ramzor 1").pack()
-        self.tl_canvas = tk.Canvas(tl1_col, width=70, height=220, bg="#222", highlightthickness=0)
+        self.tl_canvas = tk.Canvas(tl1_col, width=100, height=220, bg="#222", highlightthickness=0)
         self.tl_canvas.pack(pady=6)
-        self.tl_canvas.create_rectangle(5, 10, 65, 210, fill="#111", outline="#555", width=2)
+        self.tl_canvas.create_rectangle(20, 10, 80, 210, fill="#111", outline="#555", width=2)
         self.tl_circles = {
-            "R": self.tl_canvas.create_oval(15, 20, 55, 60, fill="#400000", outline=""),
-            "Y": self.tl_canvas.create_oval(15, 85, 55, 125, fill="#403000", outline=""),
-            "G": self.tl_canvas.create_oval(15, 150, 55, 190, fill="#004000", outline=""),
+            "R": self.tl_canvas.create_oval(30, 20, 70, 60, fill="#400000", outline=""),
+            "Y": self.tl_canvas.create_oval(30, 85, 70, 125, fill="#403000", outline=""),
+            "G": self.tl_canvas.create_oval(30, 150, 70, 190, fill="#004000", outline=""),
         }
-        ttk.Checkbutton(tl1_col, text="Controls\ntrain",
+        ttk.Checkbutton(tl1_col, text="Controls train",
                         variable=self.ramzor1_control_enabled).pack()
 
         self.ramzor2_control_enabled = tk.BooleanVar(value=False)
         tl2_col = ttk.Frame(tl_row)
         tl2_col.pack(side="left")
         ttk.Label(tl2_col, text="Ramzor 2").pack()
-        self.tl_canvas2 = tk.Canvas(tl2_col, width=70, height=220, bg="#222", highlightthickness=0)
+        self.tl_canvas2 = tk.Canvas(tl2_col, width=100, height=220, bg="#222", highlightthickness=0)
         self.tl_canvas2.pack(pady=6)
-        self.tl_canvas2.create_rectangle(5, 10, 65, 210, fill="#111", outline="#555", width=2)
+        self.tl_canvas2.create_rectangle(20, 10, 80, 210, fill="#111", outline="#555", width=2)
         self.tl_circles2 = {
-            "R": self.tl_canvas2.create_oval(15, 20, 55, 60, fill="#400000", outline=""),
-            "Y": self.tl_canvas2.create_oval(15, 85, 55, 125, fill="#403000", outline=""),
-            "G": self.tl_canvas2.create_oval(15, 150, 55, 190, fill="#004000", outline=""),
+            "R": self.tl_canvas2.create_oval(30, 20, 70, 60, fill="#400000", outline=""),
+            "Y": self.tl_canvas2.create_oval(30, 85, 70, 125, fill="#403000", outline=""),
+            "G": self.tl_canvas2.create_oval(30, 150, 70, 190, fill="#004000", outline=""),
         }
-        ttk.Checkbutton(tl2_col, text="Controls\ntrain",
+        ttk.Checkbutton(tl2_col, text="Controls train",
                         variable=self.ramzor2_control_enabled).pack()
 
         tc_frame = ttk.LabelFrame(left_col, text="Train Control")
@@ -689,8 +635,6 @@ class Dashboard(tk.Tk):
         self.speed_label.pack(anchor="w", padx=8, pady=4)
         self.location_label = ttk.Label(tc_frame, text="Location: --", font=("Segoe UI", 11))
         self.location_label.pack(anchor="w", padx=8, pady=4)
-        self.temp_label = ttk.Label(tc_frame, text="Driver temp: --", font=("Segoe UI", 11), foreground="gray")
-        self.temp_label.pack(anchor="w", padx=8, pady=4)
 
         ds_frame = ttk.LabelFrame(left_col, text="Distance Sensor 1")
         ds_frame.pack(fill="x", **pad)
@@ -768,46 +712,20 @@ class Dashboard(tk.Tk):
         self.toggle_button = ttk.Button(button_row, text="Show Listener", command=self._toggle_log)
         self.toggle_button.pack(side="left", padx=4)
 
-        # The listener log opens in its OWN window (see _toggle_log), so it is
-        # always fully visible instead of sitting below the other panels.
-        self.log_window = None
-        self.log_text = None
+        self.log_frame = ttk.LabelFrame(left_col, text="Listener Log")
+        self.log_text = scrolledtext.ScrolledText(self.log_frame, height=12, width=58,
+                                                    font=("Consolas", 9), state="disabled")
+        self.log_text.pack(fill="both", expand=True, padx=6, pady=6)
+        # log_frame is not packed yet - _toggle_log() does that when shown
 
     def _toggle_log(self):
+        self.log_visible = not self.log_visible
         if self.log_visible:
-            self._close_log_window()
+            self.log_frame.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+            self.toggle_button.config(text="Hide Listener")
         else:
-            self._open_log_window()
-
-    def _open_log_window(self):
-        win = tk.Toplevel(self)
-        win.title("Listener Log")
-        win.geometry(f"900x520+{self.winfo_rootx() + 60}+{self.winfo_rooty() + 60}")
-        win.protocol("WM_DELETE_WINDOW", self._close_log_window)
-        text = scrolledtext.ScrolledText(win, font=("Consolas", 10), state="disabled", wrap="word")
-        text.pack(fill="both", expand=True, padx=6, pady=6)
-        # Lines that arrived while the window was closed (the main window only
-        # keeps the last LOG_MAX_LINES): show them, then follow new ones.
-        if self.log_lines:
-            text.config(state="normal")
-            text.insert("end", "\n".join(self.log_lines) + "\n")
-            text.see("end")
-            text.config(state="disabled")
-        self.log_window = win
-        self.log_text = text
-        self.log_visible = True
-        self.toggle_button.config(text="Hide Listener")
-
-    def _close_log_window(self):
-        if self.log_window is not None:
-            try:
-                self.log_window.destroy()
-            except tk.TclError:
-                pass
-        self.log_window = None
-        self.log_text = None
-        self.log_visible = False
-        self.toggle_button.config(text="Show Listener")
+            self.log_frame.pack_forget()
+            self.toggle_button.config(text="Show Listener")
 
     def _launch_pio_tool(self):
         # Looked for next to this script - keeps the two tools paired
@@ -1185,24 +1103,9 @@ class Dashboard(tk.Tk):
         self._send_train_command()
 
     def _on_speed_change(self, value_str):
-        # ttk.Scale fires this for every pixel of drag, with a float value, so
-        # a single sweep used to emit dozens of identical commands - enough to
-        # overflow the bridge's serial RX buffer ("bad command JSON" errors).
-        # Only act when the rounded 0-10 level actually changes, and coalesce
-        # rapid changes into at most one command per 150 ms (always carrying
-        # the latest level).
-        level = round(float(value_str))
-        if level == self.manual_speed_level:
-            return
-        self.manual_speed_level = level
+        self.manual_speed_level = round(float(value_str))
         if hasattr(self, "speed_value_label"):
-            self.speed_value_label.config(text=str(level))
-        if self.manual_running and not self._speed_send_pending:
-            self._speed_send_pending = True
-            self.after(150, self._flush_speed_send)
-
-    def _flush_speed_send(self):
-        self._speed_send_pending = False
+            self.speed_value_label.config(text=str(self.manual_speed_level))
         if self.manual_running:
             self._send_train_command()
 
@@ -1302,8 +1205,6 @@ class Dashboard(tk.Tk):
             pass  # logging to disk is best-effort, never crash the GUI over it
 
     def _handle_message(self, msg: dict):
-        if "event" in msg:
-            return  # bridge-internal event (boot/ready/error/command_sent), not a device message
         device = msg.get("device", "")
         slot_id = classify_device(device)
         if slot_id is None:
@@ -1322,12 +1223,6 @@ class Dashboard(tk.Tk):
                 "direction": msg.get("direction"),
                 "speed": msg.get("speed"),
                 "location": msg.get("location"),
-            }
-        elif slot_id == "train_ctrl" and mtype == "temperature":
-            self.temp_data = {
-                "temp_c": msg.get("temp_c"),
-                "valid": msg.get("valid"),
-                "time": time.time(),   # arrival time on THIS machine - staleness is judged from it
             }
         elif slot_id == "distance_sensor_1" and mtype == "distance_sensor":
             self.distance_data = {
@@ -1395,18 +1290,14 @@ class Dashboard(tk.Tk):
                 row["seen_label"].config(
                     text=f"not connected - last seen {formatted} ago", foreground="red")
 
-        # A Ramzor that is not connected shows no light (see ramzor_display_state).
-        shown1 = ramzor_display_state(self.traffic_state, self.last_seen.get("ramzor"), now)
-        shown2 = ramzor_display_state(self.traffic_state2, self.last_seen.get("ramzor2"), now)
-
         for color, circle_id in self.tl_circles.items():
-            lit = TRAFFIC_LIGHT_COLORS[color] if shown1 == color else {
+            lit = TRAFFIC_LIGHT_COLORS[color] if self.traffic_state == color else {
                 "R": "#400000", "Y": "#403000", "G": "#004000"
             }[color]
             self.tl_canvas.itemconfig(circle_id, fill=lit)
 
         for color, circle_id in self.tl_circles2.items():
-            lit = TRAFFIC_LIGHT_COLORS[color] if shown2 == color else {
+            lit = TRAFFIC_LIGHT_COLORS[color] if self.traffic_state2 == color else {
                 "R": "#400000", "Y": "#403000", "G": "#004000"
             }[color]
             self.tl_canvas2.itemconfig(circle_id, fill=lit)
@@ -1423,9 +1314,6 @@ class Dashboard(tk.Tk):
             self.direction_label.config(text=f"Direction: {d.get('direction', '--')}")
             self.speed_label.config(text=f"Speed: {d.get('speed', '--')}")
             self.location_label.config(text=f"Location: {d.get('location', '--')}")
-
-        temp_text, temp_color = format_temperature(self.temp_data, time.time())
-        self.temp_label.config(text=temp_text, foreground=temp_color)
 
         # A sensor's LAST reading was being shown (and fed into the
         # train position) forever, even after it went offline - no

@@ -33,26 +33,11 @@
 //
 // UPDATE: added distance_sensor_1 (esp32_c3_tof, VL53L0X gate device) and
 // MSG_DISTANCE_SENSOR decoding.
-//
-// UPDATE (serial output integrity): the ESP-NOW receive callback runs on
-// the WiFi task, a DIFFERENT FreeRTOS task from loop(). Previously both
-// printed to Serial, and their output interleaved mid-line (e.g. an error
-// line landing inside a train_control line), garbling - and effectively
-// dropping - real messages. Now the callback only copies the packet into a
-// queue; loop() is the ONLY thing that writes to Serial, and every output
-// line is built in full and written in a single call. Also enlarged the
-// Serial RX buffer so a burst of dashboard commands (e.g. a slider drag)
-// can't overflow it and produce "bad command JSON" errors.
-//
-// UPDATE: added MSG_TEMPERATURE decoding (DS18B20 on train_ctrl_esp32_dev,
-// mounted under its motor driver). temp_c is tempCentiC/100.0.
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
 #include <ArduinoJson.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/queue.h>
 #include "../../shared/EspNowProtocol.h"
 
 // ---------------- Known devices (MAC -> friendly name) ----------------
@@ -107,80 +92,24 @@ const char* reasonToStr(uint8_t reason) {
   }
 }
 
-// ---------------- Serial output (loop() task only) ----------------
-//
-// One call, one complete line. The leading "\n" breaks out of any
-// accumulated idle-dot line, same as the old Serial.println() did first.
-// Must only be called from loop()'s task (never from the ESP-NOW callback).
-
-void emitLine(const String &line) {
-  String out;
-  out.reserve(line.length() + 2);
-  out += '\n';
-  out += line;
-  out += '\n';
-  Serial.print(out);
-}
-
-void emitJson(JsonDocument &doc) {
-  String s;
-  serializeJson(doc, s);
-  emitLine(s);
-}
-
-void emitError(const String &message) {
-  JsonDocument doc;
-  doc["event"] = "error";
-  doc["message"] = message;
-  emitJson(doc);
-}
-
-// ---------------- ESP-NOW receive: callback -> queue -> loop() ----------------
-
-struct RxItem {
-  uint8_t mac[6];
-  int len;                              // length as received (may exceed the buffer)
-  uint8_t data[sizeof(EspNowMessage)];  // copy of at most sizeof(EspNowMessage) bytes
-};
-
-static QueueHandle_t rxQueue = nullptr;
-static volatile uint32_t rxDropped = 0;   // packets lost because the queue was full
-static uint32_t rxDroppedReported = 0;
-
 unsigned long lastActivity = 0; // reset whenever a real ESP-NOW message arrives
 
-// Runs on the WiFi task. Does NOT touch Serial - just hands the packet over.
 void onDataRecv(const uint8_t *mac_addr, const uint8_t *data, int len) {
-  if (rxQueue == nullptr) return;
-
-  RxItem item;
-  memcpy(item.mac, mac_addr, 6);
-  item.len = len;
-  int copyLen = len < 0 ? 0 : (len > (int)sizeof(item.data) ? (int)sizeof(item.data) : len);
-  memcpy(item.data, data, copyLen);
-
-  if (xQueueSend(rxQueue, &item, 0) != pdTRUE) {
-    rxDropped++;
-  }
-}
-
-// Runs in loop(). Decodes one queued packet and prints it as one JSON line.
-void processReceived(const RxItem &item) {
   lastActivity = millis(); // real activity - the idle dot timer restarts from here
 
-  String deviceName = lookupDeviceName(item.mac);
+  String deviceName = lookupDeviceName(mac_addr);
 
-  if (item.len < 1 || (size_t)item.len > sizeof(EspNowMessage)) {
-    JsonDocument bad;
-    bad["device"] = deviceName;
-    bad["type"] = "malformed";
-    emitJson(bad);
+  if (len < 1 || (size_t)len > sizeof(EspNowMessage)) {
+    Serial.println(); // break out of any accumulated dot-line first
+    Serial.print("{\"device\":\"");
+    Serial.print(deviceName);
+    Serial.println("\",\"type\":\"malformed\"}");
     return;
   }
 
   EspNowMessage msg;
   memset(&msg, 0, sizeof(msg));
-  memcpy(&msg, item.data, item.len);
+  memcpy(&msg, data, len);
 
   JsonDocument doc;
   doc["device"] = deviceName;             // from whom
@@ -211,37 +140,15 @@ void processReceived(const RxItem &item) {
       doc["reason"] = reasonToStr(msg.payload.distanceSensor.reason);
       break;
 
-    case MSG_TEMPERATURE:
-      doc["type"] = "temperature";
-      doc["temp_c"] = msg.payload.temperature.tempCentiC / 100.0;
-      doc["valid"] = msg.payload.temperature.valid == 1;
-      doc["reason"] = reasonToStr(msg.payload.temperature.reason);
-      break;
-
     default:
       doc["type"] = "unknown";
       doc["raw_type_byte"] = msg.type;
       break;
   }
 
-  emitJson(doc);
-}
-
-void drainRxQueue() {
-  RxItem item;
-  while (rxQueue != nullptr && xQueueReceive(rxQueue, &item, 0) == pdTRUE) {
-    processReceived(item);
-  }
-
-  // Report (once per change) if the callback had to drop packets.
-  uint32_t dropped = rxDropped;
-  if (dropped != rxDroppedReported) {
-    rxDroppedReported = dropped;
-    JsonDocument doc;
-    doc["event"] = "rx_dropped";
-    doc["total"] = dropped;
-    emitJson(doc);
-  }
+  Serial.println(); // break out of any accumulated dot-line first
+  serializeJson(doc, Serial);
+  Serial.println();
 }
 
 // ---------------- Outgoing commands (Serial -> ESP-NOW) ----------------
@@ -249,7 +156,10 @@ void drainRxQueue() {
 void sendTrainCommand(const String &deviceName, JsonDocument &cmdDoc) {
   const uint8_t *mac = lookupDeviceMac(deviceName);
   if (mac == nullptr) {
-    emitError("unknown target device for command: " + deviceName);
+    Serial.println();
+    Serial.print("{\"event\":\"error\",\"message\":\"unknown target device for command: ");
+    Serial.print(deviceName);
+    Serial.println("\"}");
     return;
   }
 
@@ -266,11 +176,12 @@ void sendTrainCommand(const String &deviceName, JsonDocument &cmdDoc) {
 
   esp_err_t result = esp_now_send(mac, (uint8_t *)&msg, sizeof(msg));
 
-  JsonDocument ack;
-  ack["event"] = "command_sent";
-  ack["device"] = deviceName;
-  ack["ok"] = (result == ESP_OK);
-  emitJson(ack);
+  Serial.println();
+  Serial.print("{\"event\":\"command_sent\",\"device\":\"");
+  Serial.print(deviceName);
+  Serial.print("\",\"ok\":");
+  Serial.print(result == ESP_OK ? "true" : "false");
+  Serial.println("}");
 }
 
 // Reads whatever's available on Serial, one line at a time, without
@@ -285,14 +196,20 @@ void pollSerialCommands() {
         JsonDocument doc;
         DeserializationError err = deserializeJson(doc, lineBuf);
         if (err) {
-          emitError(String("bad command JSON: ") + err.c_str());
+          Serial.println();
+          Serial.print("{\"event\":\"error\",\"message\":\"bad command JSON: ");
+          Serial.print(err.c_str());
+          Serial.println("\"}");
         } else {
           String cmd = doc["cmd"] | "";
           if (cmd.equals("train_command")) {
             String deviceName = doc["device"] | "";
             sendTrainCommand(deviceName, doc);
           } else {
-            emitError("unknown cmd: " + cmd);
+            Serial.println();
+            Serial.print("{\"event\":\"error\",\"message\":\"unknown cmd: ");
+            Serial.print(cmd);
+            Serial.println("\"}");
           }
         }
       }
@@ -304,28 +221,20 @@ void pollSerialCommands() {
 }
 
 void setup() {
-  // Must be set BEFORE Serial.begin(). Default (256 bytes) is smaller than
-  // two or three queued dashboard commands.
-  Serial.setRxBufferSize(2048);
   Serial.begin(115200);
   delay(500);
-
-  rxQueue = xQueueCreate(32, sizeof(RxItem));
 
   // WIFI_STA mode with no WiFi.begin() call - keeps the radio in a known
   // state for ESP-NOW without ever associating to an access point, so the
   // bridge stays on ESP-NOW's default channel and never conflicts with
   // sender devices. No router/internet dependency at all.
   WiFi.mode(WIFI_STA);
-  {
-    JsonDocument doc;
-    doc["event"] = "boot";
-    doc["bridge_mac"] = WiFi.macAddress();
-    emitJson(doc);
-  }
+  Serial.print("{\"event\":\"boot\",\"bridge_mac\":\"");
+  Serial.print(WiFi.macAddress());
+  Serial.println("\"}");
 
   if (esp_now_init() != ESP_OK) {
-    emitError("ESP-NOW init failed");
+    Serial.println("{\"event\":\"error\",\"message\":\"ESP-NOW init failed\"}");
     return;
   }
 
@@ -339,20 +248,17 @@ void setup() {
     peerInfo.channel = 0;
     peerInfo.encrypt = false;
     if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-      emitError(String("failed to add peer: ") + knownDevices[i].name);
+      Serial.print("{\"event\":\"error\",\"message\":\"failed to add peer: ");
+      Serial.print(knownDevices[i].name);
+      Serial.println("\"}");
     }
   }
 
-  {
-    JsonDocument doc;
-    doc["event"] = "ready";
-    emitJson(doc);
-  }
+  Serial.println("{\"event\":\"ready\"}");
   lastActivity = millis();
 }
 
 void loop() {
-  drainRxQueue();
   pollSerialCommands();
 
   // Idle indicator: print a single "." (no newline) every 10 seconds of

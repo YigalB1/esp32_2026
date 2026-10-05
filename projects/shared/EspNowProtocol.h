@@ -26,6 +26,68 @@
 //    it just starts working once senders add periodic heartbeat sends.
 //    ACTION REQUIRED: copy this file into the traffic-light and bridge
 //    projects as well.
+//  - Added MSG_TRAIN_COMMAND, ControlMode, and the trainCommand payload -
+//    the first message type that flows DOWN (dashboard -> bridge -> a
+//    device) rather than up. Lets the dashboard switch a train controller
+//    between MODE_AUTO (run its own programmed behavior, e.g. the
+//    self-test loop) and MODE_MANUAL (drive exactly what's commanded:
+//    running/direction/speed). This does NOT change the size or layout of
+//    the existing trainControl struct - it's a new branch in the union.
+//    ACTION REQUIRED: copy this file into every project that sends OR
+//    receives train commands (train controllers, the bridge).
+//  - Added watchdogSeconds to trainCommand. Design split: the DEVICE is
+//    the only thing still running once the link is down, so it's the
+//    only thing that can actually enforce a cutoff (mechanism) - but the
+//    THRESHOLD is decided and owned by the dashboard (policy), sent with
+//    every command rather than hardcoded in firmware. Applies in both
+//    MODE_AUTO and MODE_MANUAL - the dashboard is expected to keep
+//    "checking in" periodically (well under this threshold) in either
+//    mode, not just while manually driving.
+//    ACTION REQUIRED: copy this file into every project that sends OR
+//    receives train commands (train controllers, the bridge).
+//  - Added MSG_CAMERA_DETECT and the cameraDetect payload - the first
+//    message type from the esp32_eye/ESP32-CAM camera-based detection
+//    devices (device -> bridge). Reuses EspNowReason as-is: REASON_BOOT
+//    for the boot announcement, REASON_STATE_CHANGE whenever the device's
+//    empty/object classification flips, REASON_HEARTBEAT on the same
+//    periodic timer as other device types. Deliberately minimal for now -
+//    just the current state - since the devices are still desk-testing
+//    detection logic. Calibration push (dashboard -> device) and any
+//    health/confidence reporting (noise floor, threshold - for flagging a
+//    camera as unreliable due to lighting) are expected to be separate
+//    future message types once that work starts, not fields bolted onto
+//    this one.
+//    Since this lives in one shared location and every project includes
+//    it by relative path, no copying is needed - just make sure any
+//    checked-out copies (if you have more than one clone) pick up this
+//    updated file before building esp32_eye or esp_bridge.
+//  - Added MSG_DISTANCE_SENSOR and the distanceSensor payload - the first
+//    message type from the esp32_c3_tof VL53L0X-based distance gate
+//    devices (device -> bridge). Unlike cameraDetect (a bare empty/object
+//    flag), this carries the actual measured distance in mm, since a
+//    ranging sensor's real value is more useful than collapsing it to
+//    binary at the source - the bridge/dashboard can derive
+//    presence/thresholding from the raw number as needed. `valid`
+//    distinguishes "0mm because nothing's in range" from a genuine
+//    near-zero reading. Reuses EspNowReason as-is: REASON_BOOT,
+//    REASON_STATE_CHANGE (sent when the reading changes by more than a
+//    device-side threshold, not on every single sample),
+//    REASON_HEARTBEAT on the same HEARTBEAT_INTERVAL_MS cadence defined
+//    in EspNowTiming.h as other device types.
+//    ACTION REQUIRED: copy this file into the esp32_c3_tof project and
+//    the bridge project (same single-shared-location caveat as above -
+//    just make sure any other checked-out copies pick this up).
+//  - Added MSG_TEMPERATURE and the temperature payload - DS18B20 reading
+//    from Train_ctrl_esp32_dev (device -> bridge), mounted under the motor
+//    driver to monitor its heat. `tempCentiC` is hundredths of a degree C
+//    (int16_t, avoids floats over the wire). `valid` distinguishes "sensor
+//    missing or read failed" from a real reading - never send a made-up
+//    number. Reuses EspNowReason as-is: REASON_BOOT at startup,
+//    REASON_STATE_CHANGE when the value moves by 0.5 C or more,
+//    REASON_HEARTBEAT on the normal heartbeat timer.
+//    ACTION REQUIRED: copy this file into Train_ctrl_esp32_dev and the
+//    bridge project (same single-shared-location caveat as above - just
+//    make sure any other checked-out copies pick this up).
 
 #pragma once
 #include <stdint.h>
@@ -33,6 +95,10 @@
 enum MsgType : uint8_t {
   MSG_TRAFFIC_LIGHT = 1,
   MSG_TRAIN_CONTROL = 2,
+  MSG_TRAIN_COMMAND = 3, // dashboard -> bridge -> device: switch mode / drive manually
+  MSG_CAMERA_DETECT = 4, // camera device -> bridge: empty/object state
+  MSG_DISTANCE_SENSOR = 5, // ToF distance device -> bridge: measured distance in mm
+  MSG_TEMPERATURE = 6, // DS18B20 device -> bridge: measured temperature
 };
 
 // Generic "reason" codes - why this message was sent. Shared across device
@@ -41,6 +107,20 @@ enum EspNowReason : uint8_t {
   REASON_BOOT = 0,         // device just powered on / reset
   REASON_STATE_CHANGE = 1, // the device's reported state changed
   REASON_HEARTBEAT = 2,    // periodic "I'm still alive", no state change
+};
+
+// Which behavior a train controller is currently following.
+enum ControlMode : uint8_t {
+  MODE_AUTO = 0,   // run the device's own programmed behavior (e.g. self-test loop)
+  MODE_MANUAL = 1, // drive exactly what's commanded (running/direction/speed below)
+};
+
+// Whether a camera-based detection device currently sees the track as
+// clear or occupied. Kept separate from EspNowReason - state is "what is
+// true right now", reason is "why you're hearing about it this time".
+enum DetectState : uint8_t {
+  DETECT_EMPTY = 0,
+  DETECT_OBJECT = 1,
 };
 
 typedef struct {
@@ -58,6 +138,34 @@ typedef struct {
       float   location;   // however you end up encoding position
       uint8_t reason;     // one of EspNowReason (e.g. REASON_BOOT at power-up)
     } trainControl;
+
+    struct {
+      uint8_t mode;             // one of ControlMode
+      uint8_t running;          // 0 = stopped, 1 = running - only meaningful in MODE_MANUAL
+      int8_t  direction;        // -1/0/1, same convention as trainControl - only meaningful if running
+      uint8_t speed;            // 0-255 - only meaningful if running
+      uint16_t watchdogSeconds; // dashboard-set: seconds without a command before
+                                 // the device fail-safes (stops the motor). Applies
+                                 // in both MODE_AUTO and MODE_MANUAL. 0 = leave the
+                                 // device's current watchdog value unchanged.
+    } trainCommand;
+
+    struct {
+      uint8_t state;  // one of DetectState - empty or object, right now
+      uint8_t reason; // one of EspNowReason
+    } cameraDetect;
+
+    struct {
+      uint16_t distanceMm; // measured distance in mm
+      uint8_t  valid;      // 0 = out of range / no target, 1 = valid reading
+      uint8_t  reason;     // one of EspNowReason
+    } distanceSensor;
+
+    struct {
+      int16_t tempCentiC; // temperature in hundredths of a degree C
+      uint8_t valid;      // 0 = sensor missing or read failed, 1 = valid reading
+      uint8_t reason;     // one of EspNowReason
+    } temperature;
   } payload;
 
 } EspNowMessage;

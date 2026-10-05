@@ -127,20 +127,28 @@ happen to share the folder.
 - GPIO34/35 are input-only; do not use them for outputs.
 - DS18B20 temperature sensor: GPIO32 (D32), mounted under the motor driver to measure its heat.
 
-### Completed (details in docs/train-control-history.md)
-- DS18B20 temperature on Train_ctrl_esp32_dev (GPIO32): protocol `MSG_TEMPERATURE`, firmware task,
-  bridge decoding, dashboard display. Done and tested on the real train.
-- 3D-printed case for the board: projects/Train_ctrl_esp32_dev/openscad/ (v8.6, locked).
+### CURRENT TASK (branch temp-sensor): show the DS18B20 temperature on the dashboard
+Do it in this order, building and checking each step before the next:
 
-### CURRENT TASK: Raspberry Pi camera - NOT DEFINED YET
-Do not change any code until the user has described the goal. Ask first. Work on branch `rpi-cam`
-(never on main). Read docs/train-control-history.md before starting.
+1. **Protocol** - add `MSG_TEMPERATURE = 6` and a `temperature` payload branch:
+   `int16_t tempCentiC` (hundredths of a degree C), `uint8_t valid` (0 = sensor missing or
+   read failed), `uint8_t reason` (EspNowReason). Add the changelog entry.
+2. **Firmware (Train_ctrl_esp32_dev)** - add the OneWire + DallasTemperature libraries to
+   `platformio.ini`. Read the sensor on GPIO32 WITHOUT blocking: request a conversion, collect
+   the result on a later loop pass (a 12-bit conversion takes up to 750 ms; blocking would stall
+   the watchdog and motor loop). Send `MSG_TEMPERATURE` with `REASON_BOOT` at start, with
+   `REASON_STATE_CHANGE` when the value moves by 0.5 C or more, and with `REASON_HEARTBEAT` on
+   the normal heartbeat timer. A missing or disconnected sensor reports `valid = 0`, never a
+   made-up number. Update `DESIGN.md` for the D32 pin.
+3. **Bridge** - decode it into
+   `{"device":..., "time_s":..., "type":"temperature", "temp_c":<float>, "valid":<bool>, "reason":...}`
+   using the existing emit helpers. Keep the single-writer rule.
+4. **Dashboard** - handle `type == "temperature"` in the listener and show it in the Train
+   Control panel (one decimal, degrees C, `--` when invalid or never received).
+   Do not add alarm thresholds yet - ask first.
 
-### Documentation rules (every task)
-- Keep one README.md per folder under projects/ and tools/: purpose, hardware and pins, how to
-  build and flash, messages sent and received, current status, TBD list.
-- After finishing a feature, update that README and add a dated entry to
-  docs/train-control-history.md (what changed, why, version, new open items).
-- Never invent facts in documentation. If something is not in the code or the history file,
-  write "TBD" or ask the user.
-- Commit documentation together with the code it describes.
+Hardware check, not code: the DQ line needs a 4.7 k pull-up to 3.3 V and the sensor must be
+powered from 3.3 V (GPIO32 is not 5 V tolerant). Remind the user to verify this before testing.
+
+After the change: the bridge and the train board must be reflashed, and the dashboard restarted.
+Other devices need no change. Commit to the `temp-sensor` branch only - never to `main`.
